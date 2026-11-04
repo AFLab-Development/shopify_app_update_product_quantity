@@ -200,21 +200,24 @@ def get_product_variants_and_sync(
                     inventories.append({
                         "delta": delta_quantity,
                         "inventoryItemId": inventory_item,
-                        "locationId": location_id_full
+                        "locationId": location_id_full,
+                        "changeFromQuantity": None
                     })
                 elif sync_mode == "replace":
                     # Replace: set to exact quantity from file
                     inventories.append({
                         "quantity": delta_quantity,
                         "inventoryItemId": inventory_item,
-                        "locationId": location_id_full
+                        "locationId": location_id_full,
+                        "changeFromQuantity": None
                     })
                 elif sync_mode == "tabula_rasa":
                     # Tabula Rasa: set to 0 (will be handled separately)
                     inventories.append({
                         "quantity": 0,
                         "inventoryItemId": inventory_item,
-                        "locationId": location_id_full
+                        "locationId": location_id_full,
+                        "changeFromQuantity": None
                     })
         
 

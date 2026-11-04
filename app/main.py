@@ -30,7 +30,7 @@ app = FastAPI(
     version="0.0.1", 
     title="Custom Quantity by sku", 
     description="",
-    docs_url="/docs",
+    docs_url=None if os.getenv("ENVIRONMENT", "prod").lower() == "prod" else "/docs",
     root_path=os.getenv("ROOT_PATH", ""),
     lifespan=lifespan,
 )
