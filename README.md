@@ -119,3 +119,66 @@ docker-compose.yml
 ## Logs
 
 Each sync run produces a CSV file under `logs/<store_name>/` recording every quantity change, missing SKU, and duplicate entry.
+
+
+## Troubleshooting: Shopify 401 Unauthorized during sync
+
+### Root cause
+This app has two credential sources:
+- **SQLite DB** (`data/sync_app.db`) - used when `get_store_credentials()` can call the async DB function. In a ThreadPoolExecutor thread (like the sync endpoint uses), there's no running event loop so `asyncio.run()` succeeds and reads from DB.
+- **TOML fallback** (`config_stores.toml`) - used when called from async context where `asyncio.run()` fails, or when DB lookup fails.
+
+The DB can get out of sync with `config_stores.toml` (e.g., if tokens were updated in TOML after initial migration). Also tokens in the DB are encrypted with `ENCRYPTION_KEY`.
+
+### Symptoms
+- Logs show: `DEBUG: DB not available, falling back to TOML: asyncio.run() cannot be called from a running event loop` (main thread)
+- But sync runs in thread pool and gets different credentials from DB
+- Shopify returns `401: Invalid API key or access token`
+
+### How to fix
+
+#### Local development
+1. Check DB contents:
+```bash
+ENCRYPTION_KEY=your_key_here .venv/bin/python << 'PY'
+from app.database.db import get_db
+from app.database.crypto import decrypt_token
+import asyncio
+
+async def main():
+    conn = await get_db()
+    try:
+        cur = await conn.execute("SELECT store_id, store_name, api_version, access_token_encrypted FROM stores")
+        for row in await cur.fetchall():
+            token = decrypt_token(row[3])
+            print(f"{row[0]}: {row[1]} | {row[2]} | {token[:10]}...")
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+PY
+```
+
+2. Update tokens in DB to match `config_stores.toml`:
+```bash
+ENCRYPTION_KEY=your_key_here .venv/bin/python << 'PY'
+from app.database.stores import update_store
+import asyncio
+
+async def main():
+    await update_store('refrigiwear', access_token='shpat_...', api_version='2026-01')
+    await update_store('murphy', access_token='shpat_...', api_version='2026-01')
+    await update_store('sviluppo', access_token='shpat_...', api_version='2026-01')
+    print("Updated")
+    
+asyncio.run(main())
+PY
+```
+
+#### Docker deployment
+1. Copy updated DB to container or update from inside
+2. Ensure `ENCRYPTION_KEY` is set in container environment (add to `.env` and docker-compose)
+3. Restart container: `docker compose restart app`
+
+#### Production server (SSH)
+Same as above, but exec into the running container and update the DB there with the correct `ENCRYPTION_KEY`.
