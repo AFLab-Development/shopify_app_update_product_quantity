@@ -137,7 +137,7 @@ def get_product_variants_and_sync(
     
     # Process each row and match with variants efficiently
     for i, row in enumerate(data_rows):
-        print(f"DEBUG: Processing row {i+1}/{len(data_rows)}")
+        print(f"DEBUG: Processing row {i+1}/{len(data_rows)} with data: {row["sku"] if "sku" in row else row.get("barcode", "N/A")}")
         
         # Extract reference using helper function
         row_ref = _extract_reference_from_row(row, identifier_type)

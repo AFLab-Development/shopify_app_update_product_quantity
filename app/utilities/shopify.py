@@ -3,6 +3,9 @@ import shopify
 import json
 import asyncio
 import toml
+import time
+import uuid
+import urllib.error
 from pathlib import Path
 from datetime import datetime
 from shopify.base import ShopifyConnection
@@ -12,6 +15,45 @@ RESOURCE -> https://github.com/Shopify/shopify_python_api
 """
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+# Shopify rate limits can trigger HTTP 429 (Too Many Requests) responses.
+# We retry with exponential backoff (honoring the Retry-After header when present).
+GRAPHQL_MAX_RETRIES = 5
+GRAPHQL_RETRY_BASE_DELAY = 2  # seconds; doubles per attempt
+
+
+def _execute_graphql_with_retry(shopify_session, query: str, variables: dict, operation_name: str) -> str:
+    """
+        Execute a GraphQL query via the Shopify client, retrying on rate-limit (429) responses.
+        :param shopify_session: The Shopify API client (shopify module).
+        :param query: The graphql query string.
+        :param variables: The variables for the GraphQL query.
+        :param operation_name: The name of the GraphQL operation.
+        :return: The raw GraphQL response body (JSON string).
+    """
+    attempt = 0
+    while True:
+        try:
+            return shopify_session.GraphQL().execute(
+                query=query,
+                variables=variables,
+                operation_name=operation_name
+            )
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < GRAPHQL_MAX_RETRIES:
+                delay = GRAPHQL_RETRY_BASE_DELAY * (2 ** attempt)
+                try:
+                    retry_after = int(e.headers.get("Retry-After") or delay)
+                    if retry_after > 0:
+                        delay = retry_after
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                print(f"DEBUG: Shopify rate limit exceeded (HTTP 429). Retrying in {delay}s (attempt {attempt + 1}/{GRAPHQL_MAX_RETRIES})")
+                time.sleep(delay)
+                attempt += 1
+                continue
+            raise
+
 
 def get_store_credentials(store_id: str = None) -> dict:
     """
@@ -117,19 +159,11 @@ def shopify_query_graph(query: str=None, operation_name: str=None, variables: di
         gql_query_path = Path(f"{operation_name}.graphql")
         if gql_query_path.exists():
             gql_query_doc = gql_query_path.read_text()
-            response = shopify_session.GraphQL().execute(
-                query=gql_query_doc,
-                variables=variables,
-                operation_name=operation_name,
-            )
+            response = _execute_graphql_with_retry(shopify_session, gql_query_doc, variables, operation_name)
         else:
             return {"error": f"GraphQL file '{operation_name}.graphql' not found."}
     elif query:
-        response = shopify_session.GraphQL().execute(
-            query=query,
-            variables=variables,
-            operation_name=operation_name
-        )
+        response = _execute_graphql_with_retry(shopify_session, query, variables, operation_name)
     else:
         return {"error": "No query or operation_name provided."}
 
@@ -440,6 +474,10 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
         
         Shopify limits to 250 inventory changes per mutation, so we batch them.
     """
+    credentials = get_store_credentials(store_id)
+    api_version = (credentials or {}).get("api_version") or "2025-10"
+    supports_idempotency = api_version == "unstable" or api_version >= "2026-01"
+
     gql_query="""#gql
         mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
             inventoryAdjustQuantities(input: $input) {
@@ -485,6 +523,15 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
             }
         }
     """
+
+    if supports_idempotency:
+        gql_query = gql_query.replace(
+            "$input: InventoryAdjustQuantitiesInput!",
+            "$input: InventoryAdjustQuantitiesInput!, $idempotencyKey: String!",
+        ).replace(
+            "inventoryAdjustQuantities(input: $input) {",
+            "inventoryAdjustQuantities(input: $input) @idempotent(key: $idempotencyKey) {",
+        )
     
     # Batch inventories into chunks of 250 (Shopify's limit)
     BATCH_SIZE = 250
@@ -506,6 +553,8 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
                 "changes": batch
             }
         }
+        if supports_idempotency:
+            gql_variables["idempotencyKey"] = str(uuid.uuid4())
         
         result = shopify_query_graph(
                 query=gql_query,
