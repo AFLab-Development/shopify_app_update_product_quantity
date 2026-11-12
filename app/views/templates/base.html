@@ -65,8 +65,8 @@
             <h1>FORCE QUANTITY</h1>
             <nav>
                 <ul>
-                    <li><a href="{{ request.scope_root_path }}/" class="{% if page == 'home' %}active{% endif %}">Files</a></li>
-                    <li><a href="{{ request.scope_root_path }}/logs" class="{% if page == 'logs' %}active{% endif %}">Logs</a></li>
+                    <li><a href="{{ request.scope.root_path }}/" class="{% if page == 'home' %}active{% endif %}">Files</a></li>
+                    <li><a href="{{ request.scope.root_path }}/logs" class="{% if page == 'logs' %}active{% endif %}">Logs</a></li>
                 </ul>
             </nav>
         </div>

@@ -61,14 +61,19 @@ async def ensure_db_initialized(force: bool = False) -> bool:
     if not exists or force:
         await init_db()
         _db_initialized = True
+        return True
 
-        schema_path = Path(__file__).parent / "schema.sql"
-        conn = await get_db()
-        try:
+    schema_path = Path(__file__).parent / "schema.sql"
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='stores'"
+        )
+        if not await cursor.fetchone():
             await conn.executescript(schema_path.read_text())
             await conn.commit()
-        finally:
-            await conn.close()
+    finally:
+        await conn.close()
 
     _db_initialized = True
     return True
