@@ -56,7 +56,7 @@ async def create_store(
     store_id: str,
     store_name: str,
     access_token: str,
-    api_version: str = "2025-10",
+    api_version: str = "2026-01",
     title: str = "",
     is_active: bool = True,
 ) -> int:
@@ -165,7 +165,7 @@ async def import_from_toml() -> Dict[str, int]:
                 continue
 
             store_name = store_data.get("STORE_NAME", "")
-            api_version = store_data.get("API_VERSION", "2025-10")
+            api_version = store_data.get("API_VERSION") or "2026-01"
             access_token = store_data.get("ACCESS_TOKEN", "")
 
             if not store_name or not access_token:

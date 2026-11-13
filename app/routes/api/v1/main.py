@@ -661,6 +661,7 @@ async def sync_file(
 
             completed_filename = None
             has_sync_error = isinstance(sync_result, dict) and bool(sync_result.get("error"))
+            sync_error_message = sync_result.get("error") if has_sync_error else None
             sync_success = bool(sync_result) and not missing_rows and not duplicate_rows and not has_sync_error
 
             if sync_success:
@@ -691,6 +692,8 @@ async def sync_file(
             # Send final result
             if sync_success:
                 final_detail = f"File '{completed_filename or filename}' syncing completed. Marked as DONE."
+            elif has_sync_error:
+                final_detail = f"Sync failed for '{filename}': {sync_error_message}"
             elif missing_rows or duplicate_rows:
                 final_detail = f"Matching variants found missing in '{filename}'"
             else:
@@ -698,6 +701,9 @@ async def sync_file(
 
             result_data = {
                 'type': 'complete',
+                'success': sync_success,
+                'status': 'success' if sync_success else ('failed' if has_sync_error else 'warning'),
+                'error': sync_error_message,
                 'detail': final_detail,
                 'total_records': total_records,
                 'sync_mode': sync_mode,

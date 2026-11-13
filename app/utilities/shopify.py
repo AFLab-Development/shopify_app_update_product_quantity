@@ -1,8 +1,12 @@
 import os
+import re
 import shopify
 import json
 import asyncio
 import toml
+import time
+import uuid
+import urllib.error
 from pathlib import Path
 from datetime import datetime
 from shopify.base import ShopifyConnection
@@ -12,6 +16,115 @@ RESOURCE -> https://github.com/Shopify/shopify_python_api
 """
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+# Shopify rate limits can trigger HTTP 429 (Too Many Requests) responses.
+# We retry with exponential backoff (honoring the Retry-After header when present).
+GRAPHQL_MAX_RETRIES = 5
+GRAPHQL_RETRY_BASE_DELAY = 2  # seconds; doubles per attempt
+
+# Every store falls back to this version when no API version is configured.
+DEFAULT_API_VERSION = "2026-01"
+
+# The @idempotent directive is available from 2026-01 and required from 2026-04.
+IDEMPOTENT_MIN_API_VERSION = "2026-01"
+_VERSION_FORMAT = re.compile(r"^(\d{4})-(\d{2})")
+
+
+def _api_version_supports_idempotency(api_version: str | None) -> bool:
+    """Return True when the given Admin API version accepts the @idempotent directive.
+
+    ``unstable``/``latest`` and unknown values are treated as recent versions, so the
+    directive is sent; if the store is actually on an older version the mutation is
+    retried without it (see ``_is_idempotent_unsupported_error``).
+    """
+    if not api_version:
+        return True
+
+    version = str(api_version).strip().lower()
+    if version in ("unstable", "latest"):
+        return True
+
+    match = _VERSION_FORMAT.match(version)
+    if not match:
+        return True
+
+    normalized = f"{match.group(1)}-{match.group(2)}"
+    return normalized >= IDEMPOTENT_MIN_API_VERSION
+
+
+def _errors_to_text(errors) -> str:
+    """Flatten a GraphQL/user errors payload into a lowercase string for matching."""
+    if not errors:
+        return ""
+    if isinstance(errors, str):
+        return errors.lower()
+    try:
+        return json.dumps(errors, default=str).lower()
+    except (TypeError, ValueError):
+        return str(errors).lower()
+
+
+def _is_idempotent_required_error(errors) -> bool:
+    """Shopify rejected the mutation because @idempotent was missing."""
+    text = _errors_to_text(errors)
+    return "idempotent" in text and "required" in text
+
+
+def _is_idempotent_unsupported_error(errors) -> bool:
+    """Shopify rejected the @idempotent directive (old API version)."""
+    text = _errors_to_text(errors)
+    if "idempotent" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in ("unknown", "not defined", "not supported", "unsupported", "invalid")
+    )
+
+
+def _first_error_message(errors) -> str:
+    """Extract a readable message from a GraphQL error payload."""
+    if isinstance(errors, dict):
+        return str(errors.get("message") or errors)
+    if isinstance(errors, list) and errors:
+        first = errors[0]
+        if isinstance(first, dict):
+            return str(first.get("message") or first)
+        return str(first)
+    return str(errors)
+
+
+def _execute_graphql_with_retry(shopify_session, query: str, variables: dict, operation_name: str) -> str:
+    """
+        Execute a GraphQL query via the Shopify client, retrying on rate-limit (429) responses.
+        :param shopify_session: The Shopify API client (shopify module).
+        :param query: The graphql query string.
+        :param variables: The variables for the GraphQL query.
+        :param operation_name: The name of the GraphQL operation.
+        :return: The raw GraphQL response body (JSON string).
+    """
+    attempt = 0
+    while True:
+        try:
+            return shopify_session.GraphQL().execute(
+                query=query,
+                variables=variables,
+                operation_name=operation_name
+            )
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < GRAPHQL_MAX_RETRIES:
+                delay = GRAPHQL_RETRY_BASE_DELAY * (2 ** attempt)
+                try:
+                    retry_after = int(e.headers.get("Retry-After") or delay)
+                    if retry_after > 0:
+                        delay = retry_after
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                print(f"DEBUG: Shopify rate limit exceeded (HTTP 429). Retrying in {delay}s (attempt {attempt + 1}/{GRAPHQL_MAX_RETRIES})")
+                time.sleep(delay)
+                attempt += 1
+                continue
+            raise
+
 
 def get_store_credentials(store_id: str = None) -> dict:
     """
@@ -26,7 +139,7 @@ def get_store_credentials(store_id: str = None) -> dict:
                 return {
                     "access_token": creds.get("ACCESS_TOKEN"),
                     "base_url": f"{creds.get('STORE_NAME')}.myshopify.com",
-                    "api_version": creds.get("API_VERSION", "2025-10")
+                    "api_version": creds.get("API_VERSION") or DEFAULT_API_VERSION
                 }
         except Exception as e:
             print(f"DEBUG: DB not available, falling back to TOML: {e}")
@@ -40,7 +153,7 @@ def get_store_credentials(store_id: str = None) -> dict:
                 return {
                     "access_token": store_config.get("ACCESS_TOKEN"),
                     "base_url": f"{store_config.get('STORE_NAME')}.myshopify.com",
-                    "api_version": store_config.get("API_VERSION", "2025-10")
+                    "api_version": store_config.get("API_VERSION") or DEFAULT_API_VERSION
                 }
     except Exception as e:
         print(f"DEBUG: TOML not available: {e}")
@@ -51,7 +164,7 @@ def get_store_credentials(store_id: str = None) -> dict:
         return {
             "access_token": access_token,
             "base_url": f"{store_name}.myshopify.com",
-            "api_version": os.environ.get("API_VERSION", "2025-10")
+            "api_version": os.environ.get("API_VERSION") or DEFAULT_API_VERSION
         }
     
     return None
@@ -69,7 +182,7 @@ def shopify_connection(credentials: dict = None, store_id: str = None) -> tuple[
         # Extract credentials from the dictionary
         access_token = credentials["access_token"] if "access_token" in credentials else None
         base_url = credentials["base_url"] if "base_url" in credentials else None
-        api_version = credentials.get("api_version", "2025-04")
+        api_version = credentials.get("api_version") or DEFAULT_API_VERSION
     else:
         # Get credentials from config or environment
         creds = get_store_credentials(store_id)
@@ -93,20 +206,22 @@ def shopify_connection(credentials: dict = None, store_id: str = None) -> tuple[
         print(f"Error: {e}")
         return None
 
-def shopify_query_graph(query: str=None, operation_name: str=None, variables: dict|None = None, store_id: str = None) -> dict:
+def shopify_query_graph(query: str=None, operation_name: str=None, variables: dict|None = None, store_id: str = None, credentials: dict|None = None) -> dict:
     """
         Execute a GraphQL query against the Shopify API.
         :param query: str: the graphql query if operation file is missing
         :param operation_name: str: The name of the GraphQL operation. Must match the name in the GraphQL file.
         :param variables: dict: The variables for the GraphQL query. Default is None.
         :param store_id: str: The store ID from config to use for the connection.
+        :param credentials: dict: Optional pre-resolved credentials, so the caller and the
+            connection use exactly the same store/API version.
 
         :return: dict: The response from the Shopify API.
     """
     if not query and not operation_name:
         return{"error": "Missing parameters"}
     
-    shopify_session = shopify_connection(store_id=store_id)
+    shopify_session = shopify_connection(credentials=credentials, store_id=store_id)
     
     if shopify_session is None:
         print("ERROR: Failed to establish Shopify connection")
@@ -117,19 +232,11 @@ def shopify_query_graph(query: str=None, operation_name: str=None, variables: di
         gql_query_path = Path(f"{operation_name}.graphql")
         if gql_query_path.exists():
             gql_query_doc = gql_query_path.read_text()
-            response = shopify_session.GraphQL().execute(
-                query=gql_query_doc,
-                variables=variables,
-                operation_name=operation_name,
-            )
+            response = _execute_graphql_with_retry(shopify_session, gql_query_doc, variables, operation_name)
         else:
             return {"error": f"GraphQL file '{operation_name}.graphql' not found."}
     elif query:
-        response = shopify_session.GraphQL().execute(
-            query=query,
-            variables=variables,
-            operation_name=operation_name
-        )
+        response = _execute_graphql_with_retry(shopify_session, query, variables, operation_name)
     else:
         return {"error": "No query or operation_name provided."}
 
@@ -440,6 +547,10 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
         
         Shopify limits to 250 inventory changes per mutation, so we batch them.
     """
+    credentials = get_store_credentials(store_id)
+    api_version = (credentials or {}).get("api_version") or DEFAULT_API_VERSION
+    supports_idempotency = _api_version_supports_idempotency(api_version)
+
     gql_query="""#gql
         mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
             inventoryAdjustQuantities(input: $input) {
@@ -485,6 +596,22 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
             }
         }
     """
+
+    gql_query_without_idempotency = gql_query
+    gql_query_with_idempotency = gql_query.replace(
+        "$input: InventoryAdjustQuantitiesInput!",
+        "$input: InventoryAdjustQuantitiesInput!, $idempotencyKey: String!",
+    ).replace(
+        "inventoryAdjustQuantities(input: $input) {",
+        "inventoryAdjustQuantities(input: $input) @idempotent(key: $idempotencyKey) {",
+    )
+
+    using_idempotency = supports_idempotency
+    current_query = gql_query_with_idempotency if using_idempotency else gql_query_without_idempotency
+    print(
+        f"DEBUG: Shopify Admin API {api_version} - @idempotent "
+        f"{'enabled' if using_idempotency else 'disabled'}"
+    )
     
     # Batch inventories into chunks of 250 (Shopify's limit)
     BATCH_SIZE = 250
@@ -499,6 +626,7 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
         
         print(f"DEBUG: Processing batch {batch_num}/{total_batches} with {len(batch)} items")
         
+        idempotency_key = str(uuid.uuid4())
         gql_variables = {
             "input": {
                 "reason": "other",
@@ -506,18 +634,58 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
                 "changes": batch
             }
         }
+        if using_idempotency:
+            gql_variables["idempotencyKey"] = idempotency_key
         
-        result = shopify_query_graph(
-                query=gql_query,
-                operation_name="inventoryAdjustQuantities",
-                variables=gql_variables,
-                store_id=store_id
-        )
+        result = None
+        # A wrong API version in the store config must not block a sync: if Shopify
+        # says the directive is missing (or unknown) retry the same batch once with
+        # the opposite shape, reusing the same idempotency key.
+        for _attempt in range(2):
+            result = shopify_query_graph(
+                    query=current_query,
+                    operation_name="inventoryAdjustQuantities",
+                    variables=gql_variables,
+                    store_id=store_id,
+                    credentials=credentials,
+            )
+
+            errors = result.get("errors") if isinstance(result, dict) else None
+            if not errors:
+                break
+
+            if not using_idempotency and _is_idempotent_required_error(errors):
+                print("DEBUG: Shopify requires @idempotent - retrying batch with the directive")
+                using_idempotency = True
+                current_query = gql_query_with_idempotency
+                gql_variables["idempotencyKey"] = idempotency_key
+                continue
+
+            if using_idempotency and _is_idempotent_unsupported_error(errors):
+                print("DEBUG: Shopify rejected @idempotent - retrying batch without the directive")
+                using_idempotency = False
+                current_query = gql_query_without_idempotency
+                gql_variables.pop("idempotencyKey", None)
+                continue
+
+            break
         
         # Check for errors in this batch
+        if isinstance(result, dict) and result.get("error"):
+            message = _first_error_message(result["error"])
+            print(f"ERROR in batch {batch_num}: {result['error']}")
+            return {
+                "error": f"Failed at batch {batch_num}/{total_batches}: {message}",
+                "details": result,
+            }
+
         if result and "errors" in result:
+            message = _first_error_message(result["errors"])
             print(f"ERROR in batch {batch_num}: {result['errors']}")
-            return {"error": f"Failed at batch {batch_num}/{total_batches}", "details": result}
+            return {
+                "error": f"Failed at batch {batch_num}/{total_batches}: {message}",
+                "details": result,
+            }
         
         if result and "inventoryAdjustQuantities" in result and result["inventoryAdjustQuantities"].get("userErrors"):
             print(f"USER ERRORS in batch {batch_num}: {result['inventoryAdjustQuantities']['userErrors']}")

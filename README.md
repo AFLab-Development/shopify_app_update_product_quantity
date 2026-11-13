@@ -45,7 +45,7 @@ Create one `.env` file per store, named `.env.<store_id>` (e.g. `.env.mystore`):
 
 ```env
 STORE_NAME=my-store-handle
-API_VERSION=2025-10
+API_VERSION=2026-01
 ACCESS_TOKEN=shpat_...
 ```
 
@@ -182,3 +182,18 @@ PY
 
 #### Production server (SSH)
 Same as above, but exec into the running container and update the DB there with the correct `ENCRYPTION_KEY`.
+
+## Troubleshooting: `The @idempotent directive is required for this mutation`
+
+### Root cause
+Shopify accepts the `@idempotent` directive on `inventoryAdjustQuantities` from Admin API `2026-01` and **requires** it from `2026-04`. The app adds the directive automatically, but an old deployment (stale Docker image / uvicorn process started before the fix) can still send the mutation without it.
+
+### How to fix
+1. Rebuild/redeploy from current `main` so `app/utilities/shopify.py` includes the directive:
+```bash
+docker compose up --build -d
+```
+2. Check the store's API version in the DB (`SELECT store_id, api_version FROM stores`) and in `config_stores.toml`. It must be `2026-01` or newer.
+3. Re-run the file in `adjust` mode. The rejected mutation applied no quantity changes, so a retry is safe.
+
+The mutation now also self-heals: if Shopify reports the directive as required (or unknown), the batch is retried once with the correct query shape, reusing the same idempotency key.
