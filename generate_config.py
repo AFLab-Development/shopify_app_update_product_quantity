@@ -79,7 +79,7 @@ def generate_toml_config():
         store_config = {
             'TITLE': get_store_title(config.get('STORE_NAME', store_id)),
             'STORE_NAME': config.get('STORE_NAME', ''),
-            'API_VERSION': config.get('API_VERSION', '2025-10'),
+            'API_VERSION': config.get('API_VERSION') or '2026-01',
             'ACCESS_TOKEN': config.get('ACCESS_TOKEN', ''),
         }
         

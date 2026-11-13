@@ -231,7 +231,10 @@ def get_product_variants_and_sync(
                 # Use delta-based adjustment
                 logger.info("Executing adjust sync mode (delta-based)")
                 result = adjust_quantity_to_variant(inventories=inventories, store_id=store_id)
-                logger.success(f"Successfully adjusted quantities for {len(inventories)} items")
+                if isinstance(result, dict) and result.get("error"):
+                    logger.error(f"Inventory adjustment failed: {result['error']}")
+                else:
+                    logger.success(f"Successfully adjusted quantities for {len(inventories)} items")
             elif sync_mode == "replace":
                 # Set to exact quantities
                 logger.info("Executing replace sync mode (exact quantities)")

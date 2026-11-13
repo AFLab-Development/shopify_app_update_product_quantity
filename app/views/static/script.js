@@ -666,15 +666,18 @@ function addSyncButtonToListItem(filename) {
                                     progressCount.innerHTML = `<span style="font-size: 1.3rem;">Processing item ${data.current}/${data.total}...</span>`;
                                 }
                             } else if (data.type === 'complete') {
-                                // Mark all steps as completed
-                                document.querySelectorAll('.progress-step').forEach(step => {
-                                    step.classList.add('completed');
-                                    step.classList.remove('active');
-                                });
-                                // Set progress bar to 100%
-                                const progressBar = document.getElementById('progress-bar');
-                                if (progressBar) {
-                                    progressBar.style.width = '100%';
+                                const succeeded = data.success !== false && data.status !== 'failed';
+                                // Only mark the progress flow as completed on success.
+                                if (succeeded) {
+                                    document.querySelectorAll('.progress-step').forEach(step => {
+                                        step.classList.add('completed');
+                                        step.classList.remove('active');
+                                    });
+                                    // Set progress bar to 100%
+                                    const progressBar = document.getElementById('progress-bar');
+                                    if (progressBar) {
+                                        progressBar.style.width = '100%';
+                                    }
                                 }
                                 // Wait a moment to show completion, then show results
                                 setTimeout(() => {
@@ -775,9 +778,35 @@ function addSyncButtonToListItem(filename) {
         });
     }
 
+    function escapeHtml(value) {
+        return String(value ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    function buildSyncErrorBanner(data) {
+        const error = (data && (data.error || (data.data && data.data.error))) || null;
+        if (!error) return "";
+
+        const details = data && data.data && data.data.details && data.data.details.errors;
+        const messages = Array.isArray(details)
+            ? details.map(e => (e && e.message) || JSON.stringify(e)).join("\n")
+            : "";
+
+        return `<div class="sync-error-banner">
+            <strong>Sync failed:</strong> ${escapeHtml(error)}
+            ${messages ? `<pre>${escapeHtml(messages)}</pre>` : ""}
+        </div>`;
+    }
+
     function buildSyncTable(data) {
         let html = ""
         const missed = buildMissingSyncList(data); // Add missing SKUs section first
+
+        html += buildSyncErrorBanner(data);
 
         if (data && data.completed_filename) {
             html += `<div style="margin: 1rem 0; padding: 1rem; border-radius: 8px; background: rgba(var(--color-primary-rgb), 0.15); border: 1px solid var(--color-primary);"> <strong>DONE:</strong> source file renamed to <code>${data.completed_filename}</code></div>`;

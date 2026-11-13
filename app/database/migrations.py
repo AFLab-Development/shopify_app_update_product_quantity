@@ -58,7 +58,7 @@ async def migrate_from_toml() -> dict:
 
             store_name = store_data.get("STORE_NAME", "")
             title = store_data.get("TITLE", "")
-            api_version = store_data.get("API_VERSION", "2025-10")
+            api_version = store_data.get("API_VERSION") or "2026-01"
             access_token = store_data.get("ACCESS_TOKEN", "")
 
             if not store_name or not access_token:
