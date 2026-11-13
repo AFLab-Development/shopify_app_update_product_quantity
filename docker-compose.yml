@@ -15,7 +15,6 @@ services:
       - PYTHONPATH=/app
       - ENVIRONMENT=production
       - ROOT_PATH=/inventory-force
-      - ENCRYPTION_KEY=bjh0QUJZWXphVVhnblEzLUJIMnl5cGhUWHZ1ek1JeFk2dXJtdHluNmdpaz0=
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9999/docs')"]
@@ -23,5 +22,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    # Secrets such as ENCRYPTION_KEY are loaded from .env (never commit them).
     env_file:
       - .env
