@@ -2,8 +2,9 @@ import asyncio
 from datetime import datetime
 import os
 import json
+import traceback
 import unicodedata
-from fastapi import APIRouter, File, Path, Request, UploadFile, HTTPException, Form, Query
+from fastapi import APIRouter, Body, File, Path, Request, UploadFile, HTTPException, Form, Query
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, FileResponse
 import pandas as pd
 
@@ -18,6 +19,14 @@ from app.utilities.shopify import (
     get_product_variants_by_identifier,
     get_sale_channels,
     get_store_locations,
+    set_quantities_to_values,
+)
+from app.utilities.backups import (
+    backups_dir,
+    create_backup,
+    list_backups,
+    load_backup,
+    validate_backup_id,
 )
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../"))
@@ -871,11 +880,12 @@ async def sync_file(
             import time
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(
-                    get_product_variants_and_sync, 
-                    data_records, 
-                    store_id, 
+                    get_product_variants_and_sync,
+                    data_records,
+                    store_id,
                     sync_mode,
                     store_name,
+                    filename,
                 )
                 
                 # Show progress while waiting
@@ -887,7 +897,7 @@ async def sync_file(
                     await asyncio.sleep(0.5)
                 
                 # Wait for completion
-                sync_result, missing_rows, duplicate_rows, found_refs = future.result()
+                sync_result, missing_rows, duplicate_rows, found_refs, backup_id = future.result()
             
             print(f"DEBUG: Sync completed. Result: {type(sync_result)}, Missing: {len(missing_rows)}, Found: {len(found_refs)}")
 
@@ -944,6 +954,7 @@ async def sync_file(
                 'duplicate_rows': duplicate_rows,
                 'found_refs': list(found_refs) if found_refs else [],
                 'completed_filename': completed_filename,
+                'backup_id': backup_id,
             }
             yield f"data: {json.dumps(result_data)}\n\n"
             
@@ -963,6 +974,185 @@ async def sync_with_progress(data_rows, store_id, sync_mode, event_generator_cal
     # For now, we'll just call it synchronously
     return get_product_variants_and_sync(data_rows, store_id=store_id, sync_mode=sync_mode)
     
+
+def _get_store_backup_context(request: Request) -> tuple[str, str]:
+    """Resolve the filesystem store folder and the Shopify store id."""
+    store_name = get_current_store_name(request)
+    store_id = get_current_store_id(request)
+    if not store_name or not store_id:
+        raise HTTPException(status_code=400, detail="No store selected. Please select a store.")
+    try:
+        backups_dir(store_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return store_name, store_id
+
+
+def _backup_with_current_quantities(backup: dict, store_id: str) -> dict:
+    """Enrich a snapshot with the live quantity and the delta needed to restore."""
+    enriched = dict(backup)
+    entries = [dict(entry) for entry in (backup.get("items") or [])]
+    loc_groups: dict[str, set] = {}
+    for entry in entries:
+        loc = entry.get("location_id")
+        item = entry.get("inventory_item_id")
+        if loc and item:
+            loc_groups.setdefault(loc, set()).add(item)
+
+    current = {}
+    read_error = False
+    for loc, item_ids in loc_groups.items():
+        stock, error = get_available_quantities_at_location(
+            sorted(item_ids), loc, store_id=store_id
+        )
+        current[loc] = stock
+        read_error = read_error or error
+
+    for entry in entries:
+        loc = entry.get("location_id")
+        item = entry.get("inventory_item_id")
+        live = current.get(loc, {}).get(item)
+        entry["current_quantity"] = live
+        target = entry.get("before_quantity")
+        target_value = 0 if target is None else target
+        entry["target_quantity"] = target_value
+        entry["delta_to_restore"] = target_value - (0 if live is None else live)
+        entry["current_unstocked"] = live is None
+
+    enriched["items"] = entries
+    enriched["current_read_ok"] = not read_error
+    return enriched
+
+
+def _restore_error(status_code: int, message: str, details=None, **extra) -> JSONResponse:
+    """Build a restore error visible in both the UI and the server console.
+
+    The UI historically read FastAPI's ``detail`` key while restore errors use
+    ``error``. Emitting both, plus a console line, prevents silent failures.
+    """
+    print(f"RESTORE ERROR ({status_code}): {message}")
+    if details is not None:
+        print(f"RESTORE ERROR DETAILS: {details}")
+    content = {
+        "success": False,
+        "error": message,
+        "detail": message,
+    }
+    if details is not None:
+        content["details"] = details
+    content.update(extra)
+    return JSONResponse(status_code=status_code, content=content)
+
+
+@router.get("/backups")
+async def list_quantity_backups(request: Request):
+    store_name, _ = _get_store_backup_context(request)
+    return {"backups": list_backups(store_name)}
+
+
+@router.get("/backups/{backup_id}")
+async def get_quantity_backup(backup_id: str, request: Request):
+    store_name, store_id = _get_store_backup_context(request)
+    try:
+        validate_backup_id(backup_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    backup = load_backup(store_name, backup_id)
+    if not backup:
+        raise HTTPException(status_code=404, detail="Backup not found")
+    return _backup_with_current_quantities(backup, store_id)
+
+
+@router.post("/backups/{backup_id}/restore")
+async def restore_quantity_backup(
+    backup_id: str, request: Request, payload: dict | None = Body(default=None)
+):
+    store_name, store_id = _get_store_backup_context(request)
+    try:
+        validate_backup_id(backup_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    backup = load_backup(store_name, backup_id)
+    if not backup:
+        raise HTTPException(status_code=404, detail="Backup not found")
+
+    body = payload or {}
+    requested_refs = body.get("references")
+    if requested_refs is not None and not isinstance(requested_refs, list):
+        raise HTTPException(status_code=400, detail="references must be a list")
+
+    entries = list(backup.get("items") or [])
+    if requested_refs is not None:
+        wanted = set(requested_refs)
+        entries = [e for e in entries if e.get("reference") in wanted]
+    if not entries:
+        raise HTTPException(status_code=400, detail="No matching items in this backup")
+
+    enriched = _backup_with_current_quantities(backup, store_id)
+    selected = [
+        e for e in enriched["items"]
+        if requested_refs is None or e.get("reference") in set(requested_refs)
+    ]
+    if not enriched.get("current_read_ok"):
+        return _restore_error(
+            400, "Cannot restore: Shopify stock could not be read. Try again."
+        )
+
+    # Snapshot the pre-restore state so this restore is itself undoable.
+    undo_items = [
+        {
+            "reference": e.get("reference"),
+            "inventory_item_id": e.get("inventory_item_id"),
+            "location_id": e.get("location_id"),
+            "variant_name": e.get("variant_name"),
+            "before_quantity": e.get("current_quantity"),
+            "was_stocked": not e.get("current_unstocked", False),
+            "stock_read_ok": True,
+        }
+        for e in selected
+    ]
+    try:
+        new_backup_id = create_backup(
+            store_name,
+            source_file=f"restore of {backup_id}",
+            sync_mode="restore",
+            location=backup.get("location"),
+            items=undo_items,
+        )
+    except Exception as exc:
+        print(f"RESTORE ERROR: could not create restore backup\n{traceback.format_exc()}")
+        return _restore_error(
+            500, f"Could not create restore backup: {exc}"
+        )
+
+    targets = [
+        {
+            "inventoryItemId": e.get("inventory_item_id"),
+            "locationId": e.get("location_id"),
+            "quantity": e.get("target_quantity"),
+        }
+        for e in selected
+        if e.get("inventory_item_id") and e.get("location_id")
+    ]
+    result = set_quantities_to_values(targets, store_id=store_id)
+    if isinstance(result, dict) and result.get("error"):
+        return _restore_error(
+            400,
+            result["error"],
+            details=result.get("details"),
+            restore_backup_id=new_backup_id,
+        )
+
+    return {
+        "success": True,
+        "restored_count": len(targets),
+        "unchanged": (result or {}).get("unchanged", []),
+        "final_quantities": (result or {}).get("final_quantities", {}),
+        "restore_backup_id": new_backup_id,
+    }
+
 
 @router.post("/uploadFile")
 async def upload_file(request: Request, file: UploadFile = File(...)):

@@ -1,11 +1,14 @@
 from app.utilities.shopify import (
     add_to_sale_channels, 
     adjust_quantity_to_variant, 
+    get_available_quantities_at_location,
     get_product_variants_by_identifier, 
+    get_store_locations,
     set_activate_quantity_on_location,
     detect_identifier_type,
     set_fixed_quantity_to_variant
 )
+from app.utilities.backups import create_backup
 from app.utilities.logger import create_sync_logger
 import pandas as pd
 
@@ -102,7 +105,8 @@ def get_product_variants_and_sync(
     store_id: str = None,
     sync_mode: str = "adjust",
     log_store_name: str = None,
-) -> list[dict, list, list, list]:
+    source_file: str = None,
+) -> tuple:
     
     # Initialize logger for this sync operation
     logger = create_sync_logger(store_name=log_store_name or store_id or "unknown_store")
@@ -148,7 +152,7 @@ def get_product_variants_and_sync(
     if not product_variants:
         print("DEBUG: No variants found, returning early")
         logger.error("No variants found in Shopify matching the provided references")
-        return [], prod_reference, [], []
+        return [], prod_reference, [], [], None
     
     # Build variant mapping and find all existing references using helper function
     variant_map, found_refs = _build_variant_map(product_variants, identifier_type)
@@ -166,7 +170,86 @@ def get_product_variants_and_sync(
     # Log missing and duplicate items
     logger.log_missing_items(missing_rows)
     logger.log_duplicate_items(duplicate_rows)
-    
+
+    # Capture a durable snapshot of every affected quantity BEFORE any write.
+    # This is the undo point used by the restore flow; it must be written even
+    # if a later activation or mutation fails.
+    backup_id = None
+    before_stock = {}
+    if not missing_rows and not duplicate_rows:
+        planned_entries = []
+        for i, row in enumerate(data_rows):
+            row_ref = _extract_reference_from_row(row, identifier_type)
+            location_id = row_location_ids[i]
+            if row_ref not in variant_map or not location_id:
+                continue
+            variant = variant_map[row_ref]
+            item_id = (variant.get("inventoryItem") or {}).get("id")
+            if not item_id:
+                continue
+            loc_gid = f"gid://shopify/Location/{location_id}"
+            planned_entries.append({
+                "reference": row_ref,
+                "inventory_item_id": item_id,
+                "variant_id": variant.get("id"),
+                "variant_name": variant.get("title"),
+                "sku": variant.get("sku"),
+                "barcode": variant.get("barcode"),
+                "location_id": loc_gid,
+                "requested_quantity": row.get("qta"),
+                "sync_mode": sync_mode,
+            })
+
+        read_errors = set()
+        for loc in sorted({e["location_id"] for e in planned_entries}):
+            ids = [
+                e["inventory_item_id"] for e in planned_entries
+                if e["location_id"] == loc
+            ]
+            stock, error = get_available_quantities_at_location(
+                ids, loc, store_id=store_id
+            )
+            before_stock[loc] = stock
+            if error:
+                read_errors.add(loc)
+                logger.warning(f"Could not read pre-sync stock at {loc}; backup quantities unknown")
+
+        if planned_entries:
+            location_names = {}
+            try:
+                for loc_info in get_store_locations(store_id=store_id):
+                    location_names[loc_info.get("id")] = loc_info.get("name")
+            except Exception as exc:
+                logger.warning(f"Could not resolve location names for backup: {exc}")
+
+            primary_location = planned_entries[0]["location_id"]
+            entries = []
+            for entry in planned_entries:
+                quantity = before_stock.get(entry["location_id"], {}).get(
+                    entry["inventory_item_id"]
+                )
+                entries.append({
+                    **entry,
+                    "before_quantity": quantity,
+                    "was_stocked": quantity is not None,
+                    "stock_read_ok": entry["location_id"] not in read_errors,
+                })
+
+            try:
+                backup_id = create_backup(
+                    log_store_name or store_id or "unknown_store",
+                    source_file=source_file or "(unknown file)",
+                    sync_mode=sync_mode,
+                    location={
+                        "id": primary_location,
+                        "name": location_names.get(primary_location),
+                    },
+                    items=entries,
+                )
+                logger.info(f"Pre-sync quantity backup saved: {backup_id}")
+            except Exception as exc:
+                logger.error(f"Could not save pre-sync quantity backup: {exc}")
+
     inventories = []
     result = None
     
@@ -273,7 +356,13 @@ def get_product_variants_and_sync(
             if sync_mode == "adjust":
                 # Use delta-based adjustment
                 logger.info("Executing adjust sync mode (delta-based)")
-                result = adjust_quantity_to_variant(inventories=inventories, store_id=store_id)
+                # Do not reuse the backup snapshot here: it was taken before
+                # activation, while verification must read the stock that the
+                # adjustment will actually be applied to (after activation).
+                result = adjust_quantity_to_variant(
+                    inventories=inventories,
+                    store_id=store_id,
+                )
                 if isinstance(result, dict) and result.get("error"):
                     logger.error(f"Inventory adjustment failed: {result['error']}")
                 else:
@@ -362,4 +451,4 @@ def get_product_variants_and_sync(
         changes_count=changes_count
     )
         
-    return result, missing_rows, duplicate_rows, found_refs
+    return result, missing_rows, duplicate_rows, found_refs, backup_id

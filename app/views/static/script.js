@@ -81,7 +81,7 @@ document.addEventListener("DOMContentLoaded", function () {
         }
         list.innerHTML = files.map(f => {
             const done = isDoneFilename(f);
-            return `<li class="file-row ${done ? 'file-row-done' : ''}">
+            return `<li class="file-row ${done ? 'file-row-done' : ''}" data-filename="${encodeURIComponent(f)}">
                 ${done ? '<span class="file-done-badge">DONE</span>' : ''}
                 <div class="file-label-wrap">
                     <span>${f}</span>
@@ -96,6 +96,10 @@ document.addEventListener("DOMContentLoaded", function () {
         addCheckButtonListeners();
         addDownloadButtonListeners();
         addDeleteButtonListeners();
+        // Nest each file's quantity backups in a collapsible row beneath it.
+        if (window.Backups && window.Backups.attachFileBackups) {
+            window.Backups.attachFileBackups(list);
+        }
     }
     // Add event listeners to download buttons
     function addDownloadButtonListeners() {

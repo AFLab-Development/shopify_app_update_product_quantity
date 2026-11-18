@@ -89,6 +89,9 @@
         if (data && data.completed_filename) {
             html += `<div style="margin: 1rem 0; padding: 1rem; border-radius: 8px; background: rgba(var(--color-primary-rgb), 0.15); border: 1px solid var(--color-primary);"> <strong>DONE:</strong> source file renamed to <code>${escapeHtml(data.completed_filename)}</code></div>`;
         }
+        if (data && data.backup_id) {
+            html += `<p class="sync-backup-note">Quantity backup saved before this sync: <code>${escapeHtml(data.backup_id)}</code> — see “Quantity Backups” to restore.</p>`;
+        }
 
         if (
             !data ||

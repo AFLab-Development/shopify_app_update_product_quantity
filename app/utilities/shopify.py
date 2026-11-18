@@ -588,15 +588,21 @@ def set_activate_quantity_on_location(inventoryItemId: str, locationId: str, sto
         }
     return {"inventoryLevel": level}
 
-def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
+def adjust_quantity_to_variant(
+    inventories: list[dict], store_id: str = None, before_stock: dict | None = None
+):
     """
         inventories: [{
             "delta": 2, # quantità
             "inventoryItemId": "gid://shopify/InventoryItem/56119140876579",
             "locationId": "gid://shopify/Location/105539928355"
         }]
-        
+
         Shopify limits to 250 inventory changes per mutation, so we batch them.
+
+        ``before_stock`` is the optional pre-write snapshot taken for the
+        backup; when supplied it is reused for verification instead of reading
+        the same levels a second time. Shape: {location_id: {item_id: qty}}.
     """
     credentials = get_store_credentials(store_id)
     api_version = (credentials or {}).get("api_version") or DEFAULT_API_VERSION
@@ -666,18 +672,23 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
     )
     
     # Snapshot stock before writing so the result can be verified afterwards.
+    # The sync flow may already have taken this snapshot to write its backup.
     target_locations = sorted({
         inv.get("locationId") for inv in inventories if inv.get("locationId")
     })
-    before_stock = {}
+    if before_stock is None:
+        before_stock = {}
     for loc in target_locations:
+        if loc in before_stock:
+            continue
         item_ids = [
             inv["inventoryItemId"] for inv in inventories
             if inv.get("locationId") == loc and inv.get("inventoryItemId")
         ]
-        before_stock[loc], _ = get_available_quantities_at_location(
+        level_stock, _ = get_available_quantities_at_location(
             item_ids, loc, store_id=store_id
         )
+        before_stock[loc] = level_stock
 
     # Batch inventories into chunks of 250 (Shopify's limit)
     BATCH_SIZE = 250
@@ -847,6 +858,115 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
         return merged_result
     
     return None
+
+def set_quantities_to_values(targets: list[dict], store_id: str = None):
+    """Restore absolute ``available`` quantities using the minimal delta.
+
+    ``targets`` items look like
+    ``{"inventoryItemId": ..., "locationId": ..., "quantity": int | None}``.
+    A ``None`` quantity means the item was not stocked at that location;
+    Shopify cannot delete an inventory level, so the target becomes 0.
+
+    Uses the same idempotent mutation and post-write verification as a normal
+    sync, so a restore can never be reported as successful unless Shopify
+    actually holds the requested quantities.
+    """
+    if not targets:
+        return {"restored": [], "unchanged": [], "final_quantities": {}}
+
+    target_locations = sorted({
+        t.get("locationId") for t in targets if t.get("locationId")
+    })
+    before_stock = {}
+    had_read_error = False
+    for loc in target_locations:
+        item_ids = [
+            t["inventoryItemId"] for t in targets
+            if t.get("locationId") == loc and t.get("inventoryItemId")
+        ]
+        stock, error = get_available_quantities_at_location(
+            item_ids, loc, store_id=store_id
+        )
+        before_stock[loc] = stock
+        had_read_error = had_read_error or error
+
+    if had_read_error:
+        return {
+            "error": "Cannot restore quantities: could not read the current stock in Shopify.",
+        }
+
+    inventories = []
+    unchanged = []
+    for target in targets:
+        item_id = target.get("inventoryItemId")
+        loc = target.get("locationId")
+        if not item_id or not loc:
+            continue
+        raw_quantity = target.get("quantity")
+        target_quantity = 0 if raw_quantity is None else int(raw_quantity)
+        current = before_stock.get(loc, {}).get(item_id)
+
+        if current is None:
+            activation = set_activate_quantity_on_location(
+                inventoryItemId=item_id, locationId=loc, store_id=store_id
+            )
+            if isinstance(activation, dict) and activation.get("error"):
+                return {
+                    "error": f"Cannot restore {item_id} at {loc}: {activation['error']}",
+                    "details": activation,
+                }
+            # Activation can expose an existing (inactive) level with a
+            # non-zero quantity. Use that quantity so the delta lands exactly
+            # on the requested target and verification stays consistent.
+            level = (activation or {}).get("inventoryLevel") or {}
+            for quantity in level.get("quantities") or []:
+                if quantity.get("name") == "available" and quantity.get("quantity") is not None:
+                    current = quantity["quantity"]
+                    before_stock.setdefault(loc, {})[item_id] = current
+                    break
+
+        current_quantity = 0 if current is None else current
+        delta = target_quantity - current_quantity
+
+        if delta == 0:
+            unchanged.append({
+                "inventoryItemId": item_id,
+                "locationId": loc,
+                "quantity": target_quantity,
+            })
+            continue
+
+        inventories.append({
+            "delta": delta,
+            "inventoryItemId": item_id,
+            "locationId": loc,
+            # API 2026-04 requires this field for idempotent adjustments.
+            # Passing the just-read quantity makes Shopify skip the write if
+            # stock moved between our read and the mutation; post-write
+            # verification then reports the mismatch instead of a false DONE.
+            "changeFromQuantity": current_quantity,
+        })
+
+    if not inventories:
+        return {
+            "restored": [],
+            "unchanged": unchanged,
+            "final_quantities": {
+                f"{u['inventoryItemId']}|{u['locationId']}": u["quantity"]
+                for u in unchanged
+            },
+        }
+
+    result = adjust_quantity_to_variant(
+        inventories, store_id=store_id, before_stock=before_stock
+    )
+    if not isinstance(result, dict):
+        return {"error": "No response from Shopify while restoring quantities."}
+    if result.get("error"):
+        return result
+    result["unchanged"] = unchanged
+    return result
+
 
 def set_fixed_quantity_to_variant(inventories: list[dict], store_id: str = None):
     """ 
