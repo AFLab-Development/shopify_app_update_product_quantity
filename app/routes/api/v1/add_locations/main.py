@@ -23,6 +23,27 @@ def _normalize_reference_value(value) -> str:
         return str(value)
 
 
+def _normalize_location_id(value) -> str | None:
+    """Normalize a location id cell to the numeric string Shopify expects."""
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    # pandas turns an int column into floats as soon as one cell is empty
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text or None
+
+
+def _collect_location_ids(data_rows: list) -> list[str | None]:
+    """Read the target location from every row, tolerating the supported column names."""
+    return [
+        _normalize_location_id(row.get("id sede") or row.get("location_id") or row.get("location"))
+        for row in data_rows
+    ]
+
+
 def _extract_reference_from_row(row: dict, identifier_type: str) -> str:
     """Extract and normalize the reference value from a data row."""
     if identifier_type == "barcode":
@@ -104,7 +125,21 @@ def get_product_variants_and_sync(
     print(f"DEBUG: Extracted {len(prod_reference)} references")
     print(f"DEBUG: Unique references: {len(set(prod_reference))}")
     logger.info(f"Using {identifier_type} for product search")
-    
+
+    # Fail loudly on mixed-location files instead of writing quantities to
+    # locations the user never asked for (e.g. Nippon/Cortina instead of Napoli).
+    row_location_ids = _collect_location_ids(data_rows)
+    target_locations = sorted({loc for loc in row_location_ids if loc})
+    if len(target_locations) > 1:
+        raise ValueError(
+            "The file contains more than one location "
+            f"({', '.join(target_locations)}). Refusing to sync a mixed-location file."
+        )
+    if target_locations:
+        logger.info(f"Target location: {', '.join(target_locations)}")
+    else:
+        logger.warning("No location IDs found in the file; rows without a location will be skipped")
+
     product_variants = get_product_variants_by_identifier(prod_reference, identifier_type, store_id=store_id)
     
     print(f"DEBUG: Found {len(product_variants) if product_variants else 0} variants from Shopify")
@@ -148,10 +183,10 @@ def get_product_variants_and_sync(
             
             inventory_item = variant["inventoryItem"]["id"]
             
-            # Get location ID from the row (file should have this data now, all lowercase)
-            row_location_id = row.get("id sede") or row.get("location_id") or row.get("location")
-            if row_location_id:
-                location_id_full = f"gid://shopify/Location/{row_location_id}"
+            # Use the validated, normalized location id collected above.
+            location_id = row_location_ids[i]
+            if location_id:
+                location_id_full = f"gid://shopify/Location/{location_id}"
             else:
                 warning_msg = f"No location ID found for row {row_ref}"
                 print(f"WARNING: {warning_msg}")
@@ -192,8 +227,16 @@ def get_product_variants_and_sync(
                         channels=publications,
                         store_id=store_id
                     )
-                set_activate_quantity_on_location(inventoryItemId=inventory_item, locationId=location_id_full, store_id=store_id)
-                
+                activation = set_activate_quantity_on_location(
+                    inventoryItemId=inventory_item,
+                    locationId=location_id_full,
+                    store_id=store_id,
+                )
+                if isinstance(activation, dict) and activation.get("error"):
+                    raise ValueError(
+                        f"Cannot sync row {i + 1} ({row_ref}): {activation['error']}"
+                    )
+
                 # Build inventory update based on sync_mode
                 if sync_mode == "adjust":
                     # Adjust: add/subtract from existing quantity

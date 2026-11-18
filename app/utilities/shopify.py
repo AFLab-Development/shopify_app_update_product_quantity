@@ -497,12 +497,18 @@ def get_product_variants_by_barcode(barcode_list: list, store_id: str = None) ->
     return all_variants
 
 def set_activate_quantity_on_location(inventoryItemId: str, locationId: str, store_id: str = None):
+    """Activate an inventory item at a location, returning errors to the caller.
+
+    From API version 2026-04 Shopify *requires* ``@idempotent`` on this
+    mutation. Until now the call was made without it, so every activation was
+    rejected -- silently, because the caller discarded the result.
     """
-        https://shopify.dev/docs/api/admin-graphql/latest/mutations/inventoryActivate
-    """    
+    credentials = get_store_credentials(store_id)
+    api_version = (credentials or {}).get("api_version") or DEFAULT_API_VERSION
+    using_idempotency = _api_version_supports_idempotency(api_version)
+    idempotency_key = str(uuid.uuid4())
 
-
-    gql_query = """#gql
+    gql_without_idempotency = """#gql
         mutation ActivateInventoryItem($inventoryItemId: ID!, $locationId: ID!, $available: Int) {
             inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId, available: $available) {
                 inventoryLevel {
@@ -518,24 +524,69 @@ def set_activate_quantity_on_location(inventoryItemId: str, locationId: str, sto
                         id
                     }
                 }
+                userErrors {
+                    field
+                    message
+                }
             }
         }
     """
-    
-    gql_variables = {
-       "inventoryItemId": inventoryItemId,
-       "locationId": locationId,
-    #    "available": 0  # Set to 0 to activate without changing quantity
-    }
-    
-    result = shopify_query_graph(
-            query=gql_query,
-            operation_name="ActivateInventoryItem",
-            variables=gql_variables,
-            store_id=store_id
+    gql_with_idempotency = gql_without_idempotency.replace(
+        "$locationId: ID!, $available: Int) {",
+        "$locationId: ID!, $available: Int, $idempotencyKey: String!) {",
+    ).replace(
+        "inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId, available: $available) {",
+        "inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId, available: $available) @idempotent(key: $idempotencyKey) {",
     )
-    
-    return result
+
+    variables = {"inventoryItemId": inventoryItemId, "locationId": locationId}
+    result = None
+    for _attempt in range(2):
+        query = gql_with_idempotency if using_idempotency else gql_without_idempotency
+        attempt_variables = dict(variables)
+        if using_idempotency:
+            attempt_variables["idempotencyKey"] = idempotency_key
+        result = shopify_query_graph(
+            query=query,
+            operation_name="ActivateInventoryItem",
+            variables=attempt_variables,
+            store_id=store_id,
+            credentials=credentials,
+        )
+        errors = result.get("errors") if isinstance(result, dict) else None
+        if not errors:
+            break
+        if not using_idempotency and _is_idempotent_required_error(errors):
+            using_idempotency = True
+            continue
+        if using_idempotency and _is_idempotent_unsupported_error(errors):
+            using_idempotency = False
+            continue
+        break
+
+    if not isinstance(result, dict):
+        return {"error": "No response from Shopify while activating the location.", "details": result}
+    if result.get("error") or result.get("errors"):
+        errors = result.get("error") or result.get("errors")
+        return {
+            "error": f"Could not activate the item at this location: {_first_error_message(errors)}",
+            "details": result,
+        }
+
+    payload = result.get("inventoryActivate") or {}
+    user_errors = payload.get("userErrors") or []
+    if user_errors:
+        return {
+            "error": f"Could not activate the item at this location: {_first_error_message(user_errors)}",
+            "details": result,
+        }
+    level = payload.get("inventoryLevel")
+    if not level:
+        return {
+            "error": "Shopify did not return an inventory level after activation.",
+            "details": result,
+        }
+    return {"inventoryLevel": level}
 
 def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
     """
@@ -566,6 +617,7 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
                             name
                         }
                         item {
+                           id
                            inventoryLevels(first: 50){
                                nodes{
                                    location {
@@ -613,6 +665,20 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
         f"{'enabled' if using_idempotency else 'disabled'}"
     )
     
+    # Snapshot stock before writing so the result can be verified afterwards.
+    target_locations = sorted({
+        inv.get("locationId") for inv in inventories if inv.get("locationId")
+    })
+    before_stock = {}
+    for loc in target_locations:
+        item_ids = [
+            inv["inventoryItemId"] for inv in inventories
+            if inv.get("locationId") == loc and inv.get("inventoryItemId")
+        ]
+        before_stock[loc], _ = get_available_quantities_at_location(
+            item_ids, loc, store_id=store_id
+        )
+
     # Batch inventories into chunks of 250 (Shopify's limit)
     BATCH_SIZE = 250
     all_results = []
@@ -690,9 +756,63 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
         if result and "inventoryAdjustQuantities" in result and result["inventoryAdjustQuantities"].get("userErrors"):
             print(f"USER ERRORS in batch {batch_num}: {result['inventoryAdjustQuantities']['userErrors']}")
             return {"error": f"User errors in batch {batch_num}/{total_batches}", "details": result}
-        
+
         all_results.append(result)
-    
+
+    # Verify the mutation actually changed Shopify. A clean GraphQL response
+    # is not proof: deltas sent to an unstocked/inactive location are echoed
+    # back in `changes` without changing any quantity.
+    after_stock = {}
+    for loc in target_locations:
+        item_ids = [
+            inv["inventoryItemId"] for inv in inventories
+            if inv.get("locationId") == loc and inv.get("inventoryItemId")
+        ]
+        stock, read_error = get_available_quantities_at_location(
+            item_ids, loc, store_id=store_id
+        )
+        if read_error:
+            return {
+                "error": f"Verification failed: could not read stock at {loc}.",
+                "details": {"location": loc},
+            }
+        after_stock[loc] = stock
+
+    final_quantities = {}
+    mismatches = []
+    for inv in inventories:
+        item_id = inv.get("inventoryItemId")
+        loc = inv.get("locationId")
+        delta = inv.get("delta")
+        if not item_id or not loc or delta is None:
+            continue
+        before = before_stock.get(loc, {}).get(item_id)
+        before = 0 if before is None else before
+        expected = before + delta
+        actual = after_stock.get(loc, {}).get(item_id)
+        final_quantities[f"{item_id}|{loc}"] = actual
+        if actual != expected:
+            mismatches.append({
+                "inventoryItemId": item_id,
+                "locationId": loc,
+                "delta": delta,
+                "before": before,
+                "expected": expected,
+                "actual": actual,
+            })
+
+    if mismatches:
+        first = mismatches[0]
+        return {
+            "error": (
+                f"Inventory verification failed for {len(mismatches)} item(s): "
+                f"{first['inventoryItemId']} at {first['locationId']} expected "
+                f"{first['expected']} but found {first['actual']}. "
+                "The file was not marked as DONE."
+            ),
+            "details": {"mismatches": mismatches[:10]},
+        }
+
     # Return the combined results (or just the last one for simplicity)
     # You could merge all changes if needed
     print(f"DEBUG: Successfully processed all {total_batches} batch(es)")
@@ -720,7 +840,10 @@ def adjust_quantity_to_variant(inventories: list[dict], store_id: str = None):
                 "reason": last_group.get("reason"),
                 "referenceDocumentUri": last_group.get("referenceDocumentUri")
             })
-        
+
+        # Verified stock for each (inventory item, location) after the mutation.
+        merged_result["final_quantities"] = final_quantities
+
         return merged_result
     
     return None
@@ -884,3 +1007,111 @@ def add_to_sale_channels(resource_id: object, channels: list[dict], store_id: st
     )
 
     return res
+
+def get_store_locations(store_id: str = None) -> list[dict]:
+    """Return ``{id, name}`` for every location in the connected store."""
+    gql_query = """#gql
+        query GetStoreLocations($after: String) {
+            locations(first: 250, after: $after) {
+                nodes {
+                    id
+                    name
+                }
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }
+    """
+    locations = []
+    cursor = None
+    while True:
+        result = shopify_query_graph(
+            query=gql_query,
+            operation_name="GetStoreLocations",
+            variables={"after": cursor},
+            store_id=store_id,
+        )
+        if not isinstance(result, dict) or result.get("error") or result.get("errors"):
+            break
+        connection = result.get("locations") or {}
+        locations.extend(connection.get("nodes") or [])
+        page_info = connection.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+    return locations
+
+
+def get_sale_channels(store_id: str = None) -> list[dict]:
+    """Return ``{id, name}`` for the store's publications (sale channels)."""
+    gql_query = """#gql
+        query GetPublications {
+            publications(first: 100) {
+                nodes {
+                    id
+                    name
+                }
+            }
+        }
+    """
+    result = shopify_query_graph(
+        query=gql_query,
+        operation_name="GetPublications",
+        store_id=store_id,
+    )
+    if not isinstance(result, dict) or result.get("error") or result.get("errors"):
+        return []
+    return (result.get("publications") or {}).get("nodes") or []
+
+
+def get_available_quantities_at_location(
+    inventory_item_ids: list[str], location_id: str, store_id: str = None
+) -> tuple[dict[str, int | None], bool]:
+    """Fetch the current ``available`` quantity for items at one location.
+
+    Shopify has no bulk "inventoryLevel" query, so several ``inventoryItem``
+    root fields are aliased into a single GraphQL request (in chunks).
+
+    Returns ``(quantities, had_error)``. A ``None`` value means the item has
+    no inventory level at that location yet (so its current stock is 0);
+    ``had_error`` means the query itself failed and no value can be trusted.
+    """
+    unique_ids = list(dict.fromkeys(i for i in inventory_item_ids if i))
+    if not unique_ids or not location_id:
+        return {}, False
+
+    quantities = {}
+    had_error = False
+    chunk_size = 50
+    for start in range(0, len(unique_ids), chunk_size):
+        chunk = unique_ids[start:start + chunk_size]
+        fields = []
+        aliases = {}
+        for index, item_id in enumerate(chunk):
+            alias = f"item{index}"
+            aliases[alias] = item_id
+            fields.append(
+                f'{alias}: inventoryItem(id: "{item_id}") {{ '
+                f'inventoryLevel(locationId: "{location_id}") {{ '
+                'quantities(names: ["available"]) { name quantity } '
+                '} }'
+            )
+        query = "query StockAtLocation {\n" + "\n".join(fields) + "\n}"
+        result = shopify_query_graph(
+            query=query,
+            operation_name="StockAtLocation",
+            store_id=store_id,
+        )
+        if not isinstance(result, dict) or result.get("error") or result.get("errors"):
+            had_error = True
+            continue
+        for alias, item_id in aliases.items():
+            level = (result.get(alias) or {}).get("inventoryLevel") or {}
+            available = next(
+                (q for q in level.get("quantities", []) if q.get("name") == "available"),
+                None,
+            )
+            quantities[item_id] = available.get("quantity") if available else None
+    return quantities, had_error

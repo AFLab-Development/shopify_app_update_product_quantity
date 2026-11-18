@@ -145,18 +145,20 @@ document.addEventListener("DOMContentLoaded", function () {
                     // File has all required data and NO errors/warnings - show sync button in list
                     showSyncModeSelection();
                     addSyncButtonToListItem(filename);
-                    responseBox.innerHTML = `<div style="color: var(--color-primary);">✓ File "${filename}" is ready to sync!<br>Found all required columns: ${data.columns.join(", ")}<br>All ${data.total_skus || 0} SKUs verified in Shopify.</div>
-                    `;
+                    const safeFilename = window.CheckReport.escapeHtml(filename);
+                    responseBox.innerHTML = `<div style="color: var(--color-primary);">✓ File "${safeFilename}" is ready to sync!<br>All ${data.total_skus || 0} SKUs verified in Shopify.</div>`
+                        + window.CheckReport.build(data, filename);
                 } else {
                     // File has errors or warnings - DO NOT allow syncing
                     // Check if the issue is missing fields or missing/duplicate SKUs
                     if (data.missing_fields && data.missing_fields.length > 0) {
                         // File is missing required columns
                         showMissingFieldsConfig(data);
-                        responseBox.innerHTML = `<div style="color: var(--color-highlight);">⚠ File "${filename}" is missing required columns.<br>Please fill in the missing information below.</div>`;
+                        responseBox.innerHTML = window.CheckReport.buildSummary(data, filename)
+                            + `<div style="color: var(--color-highlight);">⚠ File "${window.CheckReport.escapeHtml(filename)}" is missing required columns.<br>Please fill in the missing information below.</div>`;
                     } else if ((data.missing_rows && data.missing_rows.length > 0) || (data.duplicate_rows && data.duplicate_rows.length > 0)) {
                         // File has missing or duplicate SKUs - Show report ONLY, NO sync button
-                        responseBox.innerHTML = `
+                        responseBox.innerHTML = window.CheckReport.buildSummary(data, filename) + `
                             <div style="color: var(--color-error); padding: 20px; background: #2a1a1a; border-radius: 8px; border: 2px solid var(--color-error);">
                                 <h3 style="margin-top: 0; color: var(--color-error);">❌ Cannot Sync - File Has Errors</h3>
                                 <p style="margin-bottom: 15px;">File "${filename}" cannot be synced due to the following issues:</p>
@@ -418,15 +420,23 @@ function addSyncButtonToListItem(filename) {
         // Update element references in case they were reset
         updateElementReferences();
 
-        const locationId = document.getElementById("location-id").value.trim();
-        const saleChannel = document.getElementById("sale-channel").value.trim();
+        const locationInput = document.getElementById("location-id");
+        const saleChannelInput = document.getElementById("sale-channel");
+        const locationFieldEl = document.getElementById("location-field");
+        const saleChannelFieldEl = document.getElementById("sale-channel-field");
+        const locationId = locationInput ? locationInput.value.trim() : "";
+        const saleChannel = saleChannelInput ? saleChannelInput.value.trim() : "";
+        // Only fields the user was actually asked to fill in should be submitted.
+        // A stale value in a hidden input must never be written into the file.
+        const locationFieldVisible = !!locationFieldEl && locationFieldEl.style.display !== "none";
+        const saleChannelFieldVisible = !!saleChannelFieldEl && saleChannelFieldEl.style.display !== "none";
 
         // Validate required fields
         let missingFields = [];
-        if (locationField.style.display !== "none" && !locationId) {
+        if (locationFieldVisible && !locationId) {
             missingFields.push("Location ID");
         }
-        if (saleChannelField.style.display !== "none" && !saleChannel) {
+        if (saleChannelFieldVisible && !saleChannel) {
             missingFields.push("Sale Channel");
         }
 
@@ -441,8 +451,8 @@ function addSyncButtonToListItem(filename) {
         try {
             // Update file with missing data
             const formData = new FormData();
-            if (locationId) formData.append("location_id", locationId);
-            if (saleChannel) formData.append("sale_channel", saleChannel);
+            if (locationFieldVisible && locationId) formData.append("location_id", locationId);
+            if (saleChannelFieldVisible && saleChannel) formData.append("sale_channel", saleChannel);
 
             const updateRes = await fetch(`/api/v1/update-file/${filename}`, {
                 method: "POST",
@@ -681,7 +691,7 @@ function addSyncButtonToListItem(filename) {
                                 }
                                 // Wait a moment to show completion, then show results
                                 setTimeout(() => {
-                                    responseBox.innerHTML = buildSyncTable(data);
+                                    responseBox.innerHTML = window.SyncTable.buildSyncTable(data);
                                     // Hide the sync config and reset state
                                     resetSyncConfig();
                                     selectedFile = null;
@@ -724,21 +734,6 @@ function addSyncButtonToListItem(filename) {
     }
 
 
-    function buildMissingSyncList(data) {
-        if (data && Array.isArray(data.missing_rows) && data.missing_rows.length > 0) {
-            return `
-            <div class="missing-sync">
-                <h3>${data.missing_rows.length} SKUs not updated (not found in store):</h3> (${((data.missing_rows.length / (data.total_records || data.missing_rows.length)) * 100).toFixed(2)}% of total items)
-                <button class="copy-all-btn" style="display: flex;justify-content: center;align-items: center;" onclick='copyMissingSKUs(${JSON.stringify(data.missing_rows)})'>
-                    <svg width="50px" height="50px" viewBox="0 0 1024 1024" class="icon"  version="1.1" xmlns="http://www.w3.org/2000/svg"><path d="M589.3 260.9v30H371.4v-30H268.9v513h117.2v-304l109.7-99.1h202.1V260.9z" fill="#E1F0FF" /><path d="M516.1 371.1l-122.9 99.8v346.8h370.4V371.1z" fill="#E1F0FF" /><path d="M752.7 370.8h21.8v435.8h-21.8z" fill="#446EB1" /><path d="M495.8 370.8h277.3v21.8H495.8z" fill="#446EB1" /><path d="M495.8 370.8h21.8v124.3h-21.8z" fill="#446EB1" /><path d="M397.7 488.7l-15.4-15.4 113.5-102.5 15.4 15.4z" fill="#446EB1" /><path d="M382.3 473.3h135.3v21.8H382.3z" fill="#446EB1" /><path d="M382.3 479.7h21.8v348.6h-21.8zM404.1 806.6h370.4v21.8H404.1z" fill="#446EB1" /><path d="M447.7 545.1h261.5v21.8H447.7zM447.7 610.5h261.5v21.8H447.7zM447.7 675.8h261.5v21.8H447.7z" fill="#6D9EE8" /><path d="M251.6 763h130.7v21.8H251.6z" fill="#446EB1" /><path d="M251.6 240.1h21.8v544.7h-21.8zM687.3 240.1h21.8v130.7h-21.8zM273.4 240.1h108.9v21.8H273.4z" fill="#446EB1" /><path d="M578.4 240.1h130.7v21.8H578.4zM360.5 196.5h21.8v108.9h-21.8zM382.3 283.7h196.1v21.8H382.3zM534.8 196.5h65.4v21.8h-65.4z" fill="#446EB1" /><path d="M360.5 196.5h65.4v21.8h-65.4zM404.1 174.7h152.5v21.8H404.1zM578.4 196.5h21.8v108.9h-21.8z" fill="#446EB1" /></svg>
-                    <span> Copy All</span>
-                </button>
-            </div>
-            `;
-        }
-        return "";
-    }
-
     // Make this function global so it can be called from inline onclick
     window.copyMissingSKUs = function (missing_skus) {
         const skus = missing_skus || [];
@@ -776,96 +771,6 @@ function addSyncButtonToListItem(filename) {
         }).catch(err => {
             alert("Failed to copy SKUs: " + err);
         });
-    }
-
-    function escapeHtml(value) {
-        return String(value ?? "")
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#39;");
-    }
-
-    function buildSyncErrorBanner(data) {
-        const error = (data && (data.error || (data.data && data.data.error))) || null;
-        if (!error) return "";
-
-        const details = data && data.data && data.data.details && data.data.details.errors;
-        const messages = Array.isArray(details)
-            ? details.map(e => (e && e.message) || JSON.stringify(e)).join("\n")
-            : "";
-
-        return `<div class="sync-error-banner">
-            <strong>Sync failed:</strong> ${escapeHtml(error)}
-            ${messages ? `<pre>${escapeHtml(messages)}</pre>` : ""}
-        </div>`;
-    }
-
-    function buildSyncTable(data) {
-        let html = ""
-        const missed = buildMissingSyncList(data); // Add missing SKUs section first
-
-        html += buildSyncErrorBanner(data);
-
-        if (data && data.completed_filename) {
-            html += `<div style="margin: 1rem 0; padding: 1rem; border-radius: 8px; background: rgba(var(--color-primary-rgb), 0.15); border: 1px solid var(--color-primary);"> <strong>DONE:</strong> source file renamed to <code>${data.completed_filename}</code></div>`;
-        }
-
-        if (
-            !data ||
-            !data.data ||
-            !data.data.inventoryAdjustQuantities ||
-            !data.data.inventoryAdjustQuantities.inventoryAdjustmentGroup ||
-            !Array.isArray(data.data.inventoryAdjustQuantities.inventoryAdjustmentGroup.changes)
-        ) {
-            html += missed
-            html += "<pre>" + JSON.stringify(data, null, 2) + "</pre>";
-            return html;
-        }
-        const changes = data.data.inventoryAdjustQuantities.inventoryAdjustmentGroup.changes;
-        html += `<table class="sync-table">
-            <caption>Inventory Adjustments</caption>
-            <thead>
-                <tr>
-                    <th>#</th>
-                    <th>Product handle</th>
-                    <th>Variant</th>
-                    <th>Location</th>
-                    <th>Quantity</th>
-                    <th>Delta (+ / -)</th>
-                </tr>
-            </thead>
-            <tbody>
-        `;
-        let rowNum = 1;
-        changes.forEach(change => {
-            const variant = change.item.variant;
-            const product = variant.product;
-            const variantName = variant.displayName || "-";
-            const productName = product && product.handle ? product.handle.replace(/-/g, " ") : "-";
-            const locations = change.item.inventoryLevels.nodes;
-            locations.forEach(loc => {
-                const locationName = loc.location.name;
-                const quantityObj = loc.quantities.find(q => q.name === "available");
-                const quantity = quantityObj ? quantityObj.quantity : "-";
-                let delta = '-';
-                if (change.location.id === loc.location.id) {
-                    delta = change.delta
-                }
-                html += `<tr>
-                    <td>${rowNum++}</td>
-                    <td>${productName}</td>
-                    <td>${variantName}</td>
-                    <td>${locationName}</td>
-                    <td>${quantity}</td>
-                    <td>${delta}</td>
-                </tr>`;
-            });
-        });
-        html += "</tbody></table>";
-        html += missed;
-        return html;
     }
 
     // Add event listeners to check buttons

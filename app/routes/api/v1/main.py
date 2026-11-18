@@ -7,11 +7,24 @@ from fastapi import APIRouter, File, Path, Request, UploadFile, HTTPException, F
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, FileResponse
 import pandas as pd
 
-from app.routes.api.v1.add_locations.main import get_product_variants_and_sync
-from app.utilities.shopify import detect_identifier_type, get_product_variants_by_identifier
+from app.routes.api.v1.add_locations.main import (
+    get_product_variants_and_sync,
+    _normalize_location_id,
+    _normalize_reference_value,
+)
+from app.utilities.shopify import (
+    detect_identifier_type,
+    get_available_quantities_at_location,
+    get_product_variants_by_identifier,
+    get_sale_channels,
+    get_store_locations,
+)
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../"))
 DONE_SUFFIX = "__DONE__"
+
+LOCATION_COLUMNS = ("id sede", "location_id", "location")
+SALE_CHANNEL_COLUMNS = ("canali di vendita", "canale di vendita", "sale_channel")
 
 # Normalize text: remove accents for column name matching
 def normalize_text(text):
@@ -75,6 +88,73 @@ def _safe_store_file_path(base_dir: str, filename: str) -> tuple[str, str]:
         raise HTTPException(status_code=400, detail="Invalid file path")
 
     return safe_filename, abs_file_path
+
+
+def _apply_requested_column_value(df, candidate_columns, column_to_add, value):
+    """Apply a UI-supplied value to a file column and report what happened.
+
+    An explicitly supplied value always wins. If the file already has one of
+    the candidate columns it is overwritten; the old behaviour silently
+    ignored the input, which could leave a wrong location in the file.
+    """
+    if not value:
+        return df, "unchanged", []
+
+    existing = next((col for col in candidate_columns if col in df.columns), None)
+    if existing is None:
+        df[column_to_add] = value
+        return df, "added", []
+
+    previous_values = [str(v).strip() for v in df[existing].dropna().unique()]
+    df[existing] = value
+    return df, "overwritten", previous_values
+
+
+
+def _is_blank(value) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _quantity_number(value):
+    """Return an int/float for a quantity cell, or None when unusable."""
+    if _is_blank(value) or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _check_payload(filename, columns, has_location, has_sale_channel, ready, detail, **extra):
+    payload = {
+        "filename": filename,
+        "columns": list(columns),
+        "total_skus": 0,
+        "has_location": has_location,
+        "has_sale_channel": has_sale_channel,
+        "missing_fields": [],
+        "missing_rows": [],
+        "duplicate_rows": [],
+        "ready_to_sync": ready,
+        "detail": detail,
+        "identifier_type": None,
+        "summary": {},
+        "target": {},
+        "warnings": [],
+        "rows": [],
+        "preview": [],
+    }
+    payload.update(extra)
+    return payload
+
 
 def get_current_store_name(request: Request = None):
     """Get current store name from cookie, header, or environment variable"""
@@ -356,16 +436,15 @@ async def check_file_structure(
     request: Request,
     filename: str = Path(..., description="The name of the file to check")
 ):
-    """Check if the file has required columns and return missing fields"""
+    """Validate a file and return a detailed preflight report."""
     store_name = get_current_store_name(request)
     if not store_name:
         raise HTTPException(status_code=400, detail="No store selected. Please select a store.")
-    
-    # Get store_id from header
+
     store_id = request.headers.get("X-Selected-Store")
     if not store_id:
         raise HTTPException(status_code=400, detail="No store selected. Please select a store.")
-    
+
     resources_dir = os.path.join(PROJECT_ROOT, "resources", store_name)
     file_path = os.path.join(resources_dir, filename)
 
@@ -373,26 +452,20 @@ async def check_file_structure(
         raise HTTPException(status_code=404, detail="File not found")
 
     try:
-        # Use pandas to read the file based on extension
         if filename.lower().endswith('.csv'):
             df = pd.read_csv(file_path)
         elif filename.lower().endswith(('.xls', '.xlsx')):
             df = pd.read_excel(file_path)
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type")
-        
-        # Convert all column names to lowercase
-        df.columns = df.columns.str.lower()
-        
-        # Normalize column names: remove accents and rename columns
-        df.columns = [normalize_text(col) for col in df.columns]
-        
-        # Check if required columns exist in the file (using normalized names)
-        has_location_in_file = any(col in ['id sede', 'location_id', 'location'] for col in df.columns)
-        has_sale_channel_in_file = any(col in ['canali di vendita', 'canale di vendita', 'sale_channel'] for col in df.columns)
-        has_quantity_in_file = any(col in ['qta', 'quantity', 'qty'] for col in df.columns)
-        has_product_ref_in_file = any(col in ['sku', 'barcode'] for col in df.columns)
-        
+
+        df.columns = [normalize_text(col) for col in df.columns.str.lower()]
+
+        has_location_in_file = any(col in LOCATION_COLUMNS for col in df.columns)
+        has_sale_channel_in_file = any(col in SALE_CHANNEL_COLUMNS for col in df.columns)
+        has_quantity_in_file = any(col in ('qta', 'quantity', 'qty') for col in df.columns)
+        has_product_ref_in_file = any(col in ('sku', 'barcode') for col in df.columns)
+
         missing_fields = []
         if not has_location_in_file:
             missing_fields.append("location_id")
@@ -402,115 +475,253 @@ async def check_file_structure(
             missing_fields.append("quantity")
         if not has_product_ref_in_file:
             missing_fields.append("sku/barcode")
-        
+
         if missing_fields:
-            print(f"DEBUG: File '{filename}' is missing fields: {missing_fields}")
-            return {
-                "filename": filename,
-                "columns": df.columns.tolist(),
-                "has_location": has_location_in_file,
-                "has_sale_channel": has_sale_channel_in_file,
-                "missing_fields": missing_fields,
-                "ready_to_sync": False,
-                "detail": f"File is missing required fields: {', '.join(missing_fields)}"
-            }
-        
-        # File Fields not missing then proceed to check products in file
-        print(f"DEBUG: File '{filename}' has all required fields.")
-        # check products in shopify
-        prod_reference = []
+            return _check_payload(
+                filename, df.columns, has_location_in_file, has_sale_channel_in_file,
+                False, f"File is missing required fields: {', '.join(missing_fields)}",
+                missing_fields=missing_fields,
+            )
+
+        location_col = next((c for c in LOCATION_COLUMNS if c in df.columns), None)
+        channel_col = next((c for c in SALE_CHANNEL_COLUMNS if c in df.columns), None)
+        quantity_col = next((c for c in ('qta', 'quantity', 'qty') if c in df.columns), None)
+        reference_col = 'barcode' if 'barcode' in df.columns else 'sku'
+
         data_records = df.to_dict(orient="records")
-        for row in data_records:
-            # Use 'barcode' if it exists, otherwise use 'sku'
-            # Convert to string and handle NaN/None values properly
-            if "barcode" in row:
-                val = row["barcode"]
-            else:
-                val = row["sku"]
-            
-            # Convert to string and handle NaN, None, and float values
-            if pd.isna(val) or val is None:
-                prod_reference.append("EMPTY_SKU")
-            elif isinstance(val, float):
-                # Remove decimal point for float numbers that are actually integers
-                prod_reference.append(str(int(val)) if val == int(val) else str(val))
-            else:
-                prod_reference.append(str(val))
-        # Auto-detect based on content if SKU field is present
+        prod_reference = [
+            _normalize_reference_value(row.get(reference_col)) for row in data_records
+        ]
         identifier_type = detect_identifier_type(prod_reference)
-        
-        product_variants = get_product_variants_by_identifier(prod_reference, identifier_type, store_id=store_id)
+        product_variants = get_product_variants_by_identifier(
+            prod_reference, identifier_type, store_id=store_id
+        )
         if not product_variants:
-            print("DEBUG: No variants found, returning early")
-            return {
-                "filename": filename,
-                "columns": df.columns.tolist(),
-                "has_location": has_location_in_file,
-                "has_sale_channel": has_sale_channel_in_file,
-                "missing_rows": prod_reference,
-                "duplicate_rows": [],
-                "ready_to_sync": False,
-                "detail": "No matching product variants found in Shopify."
-            }
-        
-            
-        # Find missing rows and duplicate rows separately
+            return _check_payload(
+                filename, df.columns, has_location_in_file, has_sale_channel_in_file,
+                False, "No matching product variants found in Shopify.",
+                total_skus=len(data_records),
+                identifier_type=identifier_type,
+                missing_rows=prod_reference,
+            )
+
+        variant_map = {}
+        variant_match_counts = {}
+        for variant in product_variants:
+            ref = _normalize_reference_value(variant.get(identifier_type))
+            if ref == "EMPTY_SKU":
+                continue
+            variant_match_counts[ref] = variant_match_counts.get(ref, 0) + 1
+            variant_map.setdefault(ref, variant)
+
+        # Names are resolved once per check so the report can say
+        # "115117195591 -> RefrigiWear Store Napoli" instead of a bare id.
+        # Shopify returns GIDs, files hold bare numeric ids: index both forms.
+        def _name_index(nodes):
+            index = {}
+            for node in nodes or []:
+                gid = node.get("id") or ""
+                name = node.get("name") or ""
+                index[gid] = name
+                index[gid.rsplit("/", 1)[-1]] = name
+            return index
+
+        locations = get_store_locations(store_id=store_id)
+        location_names = _name_index(locations)
+        channels = get_sale_channels(store_id=store_id)
+        channel_names = _name_index(channels)
+
         missing_rows = []
         duplicate_rows = []
         seen_refs = {}
-        found_refs = set()
-        
-        # Build found_refs set with proper string conversion
-        for variant in product_variants:
-            val = variant.get(identifier_type)
-            if val:
-                if pd.isna(val) or val is None:
-                    continue
-                elif isinstance(val, float):
-                    found_refs.add(str(int(val)) if val == int(val) else str(val))
-                else:
-                    found_refs.add(str(val))
-        
-        for i, row in enumerate(data_records):
-            if identifier_type == "barcode":
-                val = row.get("barcode")
+        rows_detail = []
+        matched_item_ids = []
+        location_ids = []
+        channel_ids = []
+
+        for index, row in enumerate(data_records):
+            ref = prod_reference[index]
+            quantity_raw = row.get(quantity_col)
+            quantity_number = _quantity_number(quantity_raw)
+            quantity_display = "" if _is_blank(quantity_raw) else str(quantity_raw)
+
+            location_id = _normalize_location_id(row.get(location_col))
+            channel_raw = row.get(channel_col)
+            channel_value = "" if _is_blank(channel_raw) else str(channel_raw).strip()
+            channels_in_row = [c.strip() for c in channel_value.split(",") if c.strip()]
+
+            variant = variant_map.get(ref)
+            inventory_item_id = ""
+            variant_info = variant.get("inventoryItem") or {} if variant else {}
+            if variant_info.get("id"):
+                inventory_item_id = variant_info["id"]
+                matched_item_ids.append(inventory_item_id)
+            if location_id:
+                location_ids.append(location_id)
+            channel_ids.extend(channels_in_row)
+
+            product = (variant or {}).get("product") or {}
+            product_gid = product.get("id") or ""
+            rows_detail.append({
+                "row": index + 1,
+                "reference": ref,
+                "quantity": quantity_display,
+                "quantity_number": quantity_number,
+                "location_id": location_id,
+                "location_name": location_names.get(location_id, ""),
+                "sale_channel": channel_value,
+                "matched": variant is not None,
+                "product_id": product_gid.rsplit("/", 1)[-1] if product_gid else "",
+                "variant_title": (variant or {}).get("title", ""),
+                "inventory_item_id": inventory_item_id,
+                "current_available": None,
+                "projected_after_adjust": None,
+            })
+
+            if variant is None and ref not in missing_rows:
+                missing_rows.append(ref)
+            if ref in seen_refs and ref not in duplicate_rows:
+                duplicate_rows.append(ref)
+            if ref not in seen_refs:
+                seen_refs[ref] = index
+
+        unique_location_ids = sorted(set(location_ids))
+        unique_channel_ids = sorted(set(channel_ids))
+        target_location_id = unique_location_ids[0] if len(unique_location_ids) == 1 else None
+        stock = {}
+        stock_error = False
+        if target_location_id and matched_item_ids:
+            # inventoryLevel expects the Shopify global id, not the bare number.
+            stock_gid = (
+                target_location_id
+                if target_location_id.startswith("gid://")
+                else f"gid://shopify/Location/{target_location_id}"
+            )
+            stock, stock_error = get_available_quantities_at_location(
+                matched_item_ids, stock_gid, store_id=store_id
+            )
+        for detail in rows_detail:
+            item_id = detail["inventory_item_id"]
+            quantity = detail["quantity_number"]
+            if stock_error:
+                # The query failed: do not invent a current quantity.
+                current = None
+                detail["stock_status"] = "unavailable"
+            elif item_id and item_id in stock:
+                raw_current = stock[item_id]
+                # No inventory level at the target yet means the sync will
+                # activate it at 0 and then apply the delta.
+                current = 0 if raw_current is None else raw_current
+                detail["stock_status"] = "not_stocked" if raw_current is None else "ok"
             else:
-                val = row.get("sku")
-            
-            # Convert to string with proper handling
-            if pd.isna(val) or val is None:
-                row_ref = "EMPTY_SKU"
-            elif isinstance(val, float):
-                row_ref = str(int(val)) if val == int(val) else str(val)
+                current = 0
+                detail["stock_status"] = "not_stocked" if item_id else "unavailable"
+
+            detail["current_available"] = current
+            if quantity is None:
+                detail["change"] = "—"
             else:
-                row_ref = str(val)
-            
-            if row_ref not in found_refs and row_ref not in missing_rows:
-                # This SKU doesn't exist in Shopify - add to missing list only once
-                missing_rows.append(row_ref)
-                
-            if row_ref in seen_refs and row_ref not in duplicate_rows:
-                # This SKU was already processed - it's a duplicate in the file
-                duplicate_rows.append(row_ref)
-            
-            if row_ref not in seen_refs:
-                # First occurrence of this SKU
-                seen_refs[row_ref] = i
-        
-        # Return the final result with all information
-        ready_to_sync = len(missing_rows) == 0 and len(duplicate_rows) == 0
-        return {
-            "filename": filename,
-            "columns": df.columns.tolist(),
-            "total_skus": len(data_records),
-            "has_location": has_location_in_file,
-            "has_sale_channel": has_sale_channel_in_file,
-            "missing_rows": missing_rows,
-            "duplicate_rows": duplicate_rows,
-            "ready_to_sync": ready_to_sync,
-            "detail": "File is ready to sync!" if ready_to_sync else f"File has {len(missing_rows)} missing SKUs and {len(duplicate_rows)} duplicate SKUs."
+                qty_text = str(int(quantity)) if float(quantity).is_integer() else str(quantity)
+                detail["change"] = f"+{qty_text}" if quantity > 0 else qty_text
+            detail["projected_after_adjust"] = (
+                current + quantity if current is not None and quantity is not None else None
+            )
+
+        warnings = []
+
+        def warn(message, level="warning"):
+            warnings.append({"level": level, "message": message})
+
+        if unique_location_ids:
+            known_locations = [lid for lid in unique_location_ids if lid in location_names]
+            if locations:
+                for lid in unique_location_ids:
+                    if lid not in location_names:
+                        warn(f"Location {lid} was not found in this store.")
+            if len(unique_location_ids) > 1:
+                warn(
+                    "The file targets "
+                    f"{len(unique_location_ids)} different locations: "
+                    f"{', '.join(unique_location_ids)}. Sync will be refused.",
+                    "error",
+                )
+            elif len(known_locations) == 1:
+                warn(
+                    f"Target location: {location_names[known_locations[0]]} "
+                    f"({known_locations[0]}).",
+                    "info",
+                )
+        else:
+            warn("No location ID was found in the file.", "error")
+
+        if locations and channel_ids:
+            for cid in unique_channel_ids:
+                if cid not in channel_names:
+                    warn(f"Sale channel {cid} was not found in this store.")
+
+        for ref, count in sorted(variant_match_counts.items()):
+            if count > 1:
+                warn(f"'{ref}' matches {count} Shopify variants; the first one will be used.")
+
+        zero_rows = sum(1 for d in rows_detail if d["quantity_number"] == 0)
+        negative_rows = sum(1 for d in rows_detail if (d["quantity_number"] or 0) < 0)
+        invalid_rows = sum(1 for d in rows_detail if d["quantity_number"] is None)
+        if zero_rows:
+            warn(f"{zero_rows} row(s) have a quantity of 0.")
+        if negative_rows:
+            warn(f"{negative_rows} row(s) have a negative quantity (stock will be subtracted).")
+        if invalid_rows:
+            warn(f"{invalid_rows} row(s) have a missing or non-numeric quantity.")
+
+        if stock_error:
+            warn("Current stock could not be read from Shopify; 'Before/After' is unavailable.")
+
+        quantities = [d["quantity_number"] for d in rows_detail if d["quantity_number"] is not None]
+        total_quantity = float(sum(quantities)) if quantities else 0.0
+        summary = {
+            "rows": len(rows_detail),
+            "unique_references": len(set(prod_reference)),
+            "identifier_type": identifier_type,
+            "matched": sum(1 for d in rows_detail if d["matched"]),
+            "missing": len(missing_rows),
+            "duplicates": len(duplicate_rows),
+            "total_quantity": int(total_quantity) if total_quantity.is_integer() else round(total_quantity, 2),
+            "zero_quantity_rows": zero_rows,
+            "negative_quantity_rows": negative_rows,
+            "invalid_quantity_rows": invalid_rows,
         }
-            
+        target = {
+            "location_column": location_col,
+            "location_ids": [
+                {"id": lid, "name": location_names.get(lid, ""), "known": lid in location_names}
+                for lid in unique_location_ids
+            ],
+            "single_location": len(unique_location_ids) == 1,
+            "sale_channel_column": channel_col,
+            "sale_channels": [
+                {"id": cid, "name": channel_names.get(cid, ""), "known": cid in channel_names}
+                for cid in unique_channel_ids
+            ],
+        }
+
+        ready_to_sync = not missing_rows and not duplicate_rows
+        return _check_payload(
+            filename, df.columns, has_location_in_file, has_sale_channel_in_file,
+            ready_to_sync,
+            "File is ready to sync!" if ready_to_sync
+            else f"File has {len(missing_rows)} missing SKUs and {len(duplicate_rows)} duplicate SKUs.",
+            total_skus=len(data_records),
+            identifier_type=identifier_type,
+            missing_rows=missing_rows,
+            duplicate_rows=duplicate_rows,
+            summary=summary,
+            target=target,
+            warnings=warnings,
+            rows=rows_detail,
+            preview=rows_detail[:20],
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error checking file: {e}")
 
@@ -544,13 +755,24 @@ async def update_file_with_data(
         # Convert all column names to lowercase and normalize (remove accents)
         df.columns = [normalize_text(col) for col in df.columns.str.lower()]
         
-        # Add missing columns
-        if location_id and not any(col in ['id sede', 'location_id', 'location'] for col in df.columns):
-            df['id sede'] = location_id
-            
-        if sale_channel and not any(col in ['canali di vendita', 'canale di vendita', 'sale_channel'] for col in df.columns):
-            df['canale di vendita'] = sale_channel
-        
+        # Apply UI-supplied values. An explicit value overwrites an existing
+        # column instead of being silently ignored.
+        location_action = "unchanged"
+        previous_locations = []
+        if location_id:
+            df, location_action, previous_locations = _apply_requested_column_value(
+                df, LOCATION_COLUMNS, "id sede", location_id
+            )
+        location_column = next((c for c in LOCATION_COLUMNS if c in df.columns), None)
+
+        sale_channel_action = "unchanged"
+        previous_sale_channels = []
+        if sale_channel:
+            df, sale_channel_action, previous_sale_channels = _apply_requested_column_value(
+                df, SALE_CHANNEL_COLUMNS, "canale di vendita", sale_channel
+            )
+        sale_channel_column = next((c for c in SALE_CHANNEL_COLUMNS if c in df.columns), None)
+
         # Save the updated file
         if filename.lower().endswith('.csv'):
             df.to_csv(file_path, index=False)
@@ -560,9 +782,19 @@ async def update_file_with_data(
         return {
             "detail": f"File '{filename}' updated successfully",
             "added_columns": {
-                "location_id": location_id if location_id else None,
-                "sale_channel": sale_channel if sale_channel else None
-            }
+                "location_id": location_id if location_action in ("added", "overwritten") else None,
+                "sale_channel": sale_channel if sale_channel_action in ("added", "overwritten") else None,
+            },
+            "location_column": {
+                "name": location_column,
+                "action": location_action,
+                "previous_values": previous_locations,
+            },
+            "sale_channel_column": {
+                "name": sale_channel_column,
+                "action": sale_channel_action,
+                "previous_values": previous_sale_channels,
+            },
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating file: {e}")

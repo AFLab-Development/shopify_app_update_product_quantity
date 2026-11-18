@@ -140,6 +140,11 @@ class SyncLogger:
             self.error(f"Result contains error: {result['error']}")
             return None
         
+        # Verified quantities keyed by "<inventory item>|<location>" (when
+        # available). Falling back to the levels echoed by Shopify is still
+        # supported for older callers.
+        final_quantities = result.get("final_quantities") or {}
+
         # Extract changes from the result structure
         changes = None
         if "inventoryAdjustQuantities" in result:
@@ -177,16 +182,20 @@ class SyncLogger:
                 delta = change.get("delta")
                 quantity = change.get("quantity")
                 
-                # Get final quantity from inventory levels
-                inventory_levels = item.get("inventoryLevels", {}).get("nodes", [])
-                final_quantity = None
-                for level in inventory_levels:
-                    if level.get("location", {}).get("id") == location.get("id"):
-                        quantities = level.get("quantities", [])
-                        for q in quantities:
-                            if q.get("name") == "available":
-                                final_quantity = q.get("quantity")
-                                break
+                # Prefer the quantity verified after the mutation, then fall
+                # back to the levels echoed by Shopify.
+                item_gid = item.get("id") or ""
+                verified_key = f"{item_gid}|{location.get('id', '')}"
+                final_quantity = final_quantities.get(verified_key)
+                if final_quantity is None:
+                    inventory_levels = item.get("inventoryLevels", {}).get("nodes", [])
+                    for level in inventory_levels:
+                        if level.get("location", {}).get("id") == location.get("id"):
+                            quantities = level.get("quantities", [])
+                            for q in quantities:
+                                if q.get("name") == "available":
+                                    final_quantity = q.get("quantity")
+                                    break
                 
                 parsed_changes.append({
                     "timestamp": self.timestamp,
