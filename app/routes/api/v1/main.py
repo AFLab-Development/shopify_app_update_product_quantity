@@ -35,6 +35,54 @@ DONE_SUFFIX = "__DONE__"
 LOCATION_COLUMNS = ("id sede", "location_id", "location")
 SALE_CHANNEL_COLUMNS = ("canali di vendita", "canale di vendita", "sale_channel")
 
+
+def _normalize_sale_channel_ids(value) -> list[str]:
+    """Normalize sale channel input (str/int/list/comma-separated) to numeric/string IDs."""
+    if value is None or _is_blank(value):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = []
+        for v in value:
+            items.extend(_normalize_sale_channel_ids(v))
+        # dedupe preserving order
+        seen = set()
+        out = []
+        for item in items:
+            if item and item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+    if isinstance(value, int):
+        return [str(value)]
+    if isinstance(value, float):
+        if value.is_integer():
+            return [str(int(value))]
+        return [str(value)]
+    text = str(value).strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in text.replace(";", ",").split(",")]
+    ids = []
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("gid://"):
+            part = part.rsplit("/", 1)[-1]
+        if part.endswith(".0") and part[:-2].isdigit():
+            part = part[:-2]
+        ids.append(part)
+    seen = set()
+    out = []
+    for item in ids:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _format_sale_channel_ids(value) -> str:
+    return ",".join(_normalize_sale_channel_ids(value))
+
 # Normalize text: remove accents for column name matching
 def normalize_text(text):
     return unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
@@ -99,6 +147,49 @@ def _safe_store_file_path(base_dir: str, filename: str) -> tuple[str, str]:
     return safe_filename, abs_file_path
 
 
+def _preview_cell(value):
+    """Convert a pandas cell into a JSON-safe, readable value."""
+    if value is None:
+        return ""
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        if bool(pd.isna(value)):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _resource_preview(file_path: str, max_rows: int) -> dict:
+    """Read the first rows of an uploaded Excel/CSV file for the UI preview."""
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension in (".xlsx", ".xlsm", ".xls"):
+        reader = pd.read_excel
+    elif extension == ".csv":
+        reader = pd.read_csv
+    else:
+        raise ValueError("Unsupported file type. Preview works with Excel and CSV files.")
+
+    frame = reader(file_path, nrows=max_rows + 1)
+    truncated = len(frame) > max_rows
+    frame = frame.head(max_rows)
+    return {
+        "filename": os.path.basename(file_path),
+        "columns": [str(column) for column in frame.columns],
+        "rows": [
+            [_preview_cell(cell) for cell in row]
+            for row in frame.itertuples(index=False, name=None)
+        ],
+        "row_count": len(frame),
+        "truncated": truncated,
+    }
+
+
 def _apply_requested_column_value(df, candidate_columns, column_to_add, value):
     """Apply a UI-supplied value to a file column and report what happened.
 
@@ -106,7 +197,9 @@ def _apply_requested_column_value(df, candidate_columns, column_to_add, value):
     the candidate columns it is overwritten; the old behaviour silently
     ignored the input, which could leave a wrong location in the file.
     """
-    if not value:
+    if value is None:
+        return df, "unchanged", []
+    if isinstance(value, str) and not value.strip():
         return df, "unchanged", []
 
     existing = next((col for col in candidate_columns if col in df.columns), None)
@@ -142,7 +235,151 @@ def _quantity_number(value):
     return int(number) if number.is_integer() else number
 
 
+def _issue(code, severity, title, explanation="", fix="", items=None):
+    """Build one UI-ready issue for the check response."""
+    values = [str(value) for value in (items or [])]
+    return {
+        "code": code,
+        "severity": severity,
+        "title": title,
+        "explanation": explanation,
+        "fix": fix,
+        "count": len(values) if values else 1,
+        "items": values,
+    }
+
+
+def _warning_issue(warning):
+    """Turn a preflight warning into the same shape as the other issues."""
+    message = str((warning or {}).get("message", ""))
+    level = (warning or {}).get("level", "warning")
+    severity = "info" if level == "info" else ("blocking" if level == "error" else "warning")
+    lowered = message.lower()
+
+    if "different locations" in lowered:
+        return _issue(
+            "mixed_locations", "blocking", "The file uses more than one location",
+            message,
+            "Use a single location for the whole file, or remove the location column "
+            "and set one global location above.",
+        )
+    if "no location id" in lowered:
+        return _issue(
+            "missing_location", "blocking", "No target location is set",
+            message, "Add a location ID to the file or choose a global location above.",
+        )
+    if "location" in lowered and "not found in this store" in lowered:
+        return _issue(
+            "unknown_location", "warning", "Unknown location in the file",
+            message, "Choose a location that exists in this store.",
+        )
+    if "sale channel" in lowered and "not found in this store" in lowered:
+        return _issue(
+            "unknown_sale_channel", "warning", "Unknown sale channel in the file",
+            message, "Choose a sale channel that exists in this store.",
+        )
+    if "matches" in lowered and "variants" in lowered:
+        return _issue(
+            "ambiguous_variant", "warning", "A SKU matches multiple variants",
+            message, "Use a unique barcode or SKU so the right variant is updated.",
+        )
+    if "quantity of 0" in lowered:
+        return _issue(
+            "zero_quantity", "warning", "Some rows have a quantity of zero",
+            message, "Use a non-zero quantity unless a zero update is intended.",
+        )
+    if "negative quantity" in lowered:
+        return _issue(
+            "negative_quantity", "warning", "Some rows have a negative quantity",
+            message, "In Adjust mode this subtracts stock; use Fixed mode to set an absolute quantity.",
+        )
+    if "non-numeric quantity" in lowered:
+        return _issue(
+            "invalid_quantity", "warning", "Some quantities are not numbers",
+            message, "Enter a number in the quantity column, then check the file again.",
+        )
+    if "current stock could not be read" in lowered:
+        return _issue(
+            "stock_unavailable", "warning", "Current stock is unavailable",
+            message,
+            "The before/after values can't be shown. Retry the check; if it keeps "
+            "happening, verify the Shopify connection.",
+        )
+
+    fix = "" if severity == "info" else "Review this issue, then run Select & Check again."
+    return _issue("check_" + severity, severity, message, fix=fix)
+
+
+def _build_check_issues(payload):
+    """Derive the UI-facing issue list from the existing preflight payload."""
+    issues = []
+    missing_fields = payload.get("missing_fields") or []
+    if missing_fields:
+        labels = {
+            "location_id": "location",
+            "sale_channel": "sale channel",
+            "quantity": "quantity",
+            "sku/barcode": "SKU or barcode",
+        }
+        items = [labels.get(field, field) for field in missing_fields]
+        issues.append(_issue(
+            "missing_columns", "blocking", "Required columns are missing",
+            "The file doesn't contain: " + ", ".join(items) + ".",
+            "Add these columns to the file or choose the global defaults above, "
+            "then run Select & Check again.",
+            items,
+        ))
+
+    missing_rows = [str(value) for value in payload.get("missing_rows") or []]
+    if missing_rows:
+        if str(payload.get("detail", "")).startswith("No matching product variants"):
+            issues.append(_issue(
+                "no_shopify_matches", "blocking", "No products matched in Shopify",
+                "None of the SKUs/barcodes in this file were found in the selected store.",
+                "Check the identifiers and the selected store, then check the file again.",
+                missing_rows,
+            ))
+        else:
+            noun = "SKU" if len(missing_rows) == 1 else "SKUs"
+            issues.append(_issue(
+                "missing_skus", "blocking", f"{len(missing_rows)} {noun} not found in Shopify",
+                "These products don't exist in the selected store, so their quantities "
+                "can't be updated.",
+                "Correct the SKU/barcode in the file, create the product in Shopify, "
+                "or remove the row.",
+                missing_rows,
+            ))
+
+    duplicate_rows = [str(value) for value in payload.get("duplicate_rows") or []]
+    if duplicate_rows:
+        noun = "SKU" if len(duplicate_rows) == 1 else "SKUs"
+        issues.append(_issue(
+            "duplicate_skus", "blocking", f"{len(duplicate_rows)} duplicate {noun} in the file",
+            "These SKUs appear more than once, so the app can't tell which quantity to apply.",
+            "Keep one row per SKU, or merge the quantities into a single row.",
+            duplicate_rows,
+        ))
+
+    for warning in payload.get("warnings") or []:
+        issues.append(_warning_issue(warning))
+
+    if not issues and not payload.get("ready_to_sync"):
+        issues.append(_issue(
+            "check_blocked", "blocking", "This file can't be synced yet",
+            str(payload.get("detail") or "The file did not pass the preflight check."),
+            "Review the report above and run Select & Check again.",
+        ))
+    return issues
+
+
 def _check_payload(filename, columns, has_location, has_sale_channel, ready, detail, **extra):
+    """Build a ``/check`` response.
+
+    Contract (additive): ``issues`` is an array of
+    ``{code, severity, title, explanation, fix, count, items}`` objects, where
+    severity is ``blocking``, ``warning`` or ``info``. All legacy keys stay
+    unchanged so existing callers keep working.
+    """
     payload = {
         "filename": filename,
         "columns": list(columns),
@@ -162,6 +399,7 @@ def _check_payload(filename, columns, has_location, has_sale_channel, ready, det
         "preview": [],
     }
     payload.update(extra)
+    payload["issues"] = _build_check_issues(payload)
     return payload
 
 
@@ -292,6 +530,48 @@ def health_check(request: Request):
         "endpoints": endpoints,
     }
 
+@router.get("/store-locations")
+async def list_store_locations(request: Request):
+    store_id = request.headers.get("X-Selected-Store") or get_current_store_id(request)
+    if not store_id:
+        raise HTTPException(status_code=400, detail="No store selected. Please select a store.")
+
+    locations = get_store_locations(store_id=store_id)
+    normalized = []
+    for loc in locations or []:
+        gid = str(loc.get("id", "") or "")
+        loc_id = gid.rsplit("/", 1)[-1] if gid else ""
+        if not loc_id:
+            continue
+        normalized.append({
+            "id": loc_id,
+            "gid": gid,
+            "name": loc.get("name") or loc_id,
+        })
+    return {"locations": normalized}
+
+
+@router.get("/sale-channels")
+async def list_sale_channels(request: Request):
+    store_id = request.headers.get("X-Selected-Store") or get_current_store_id(request)
+    if not store_id:
+        raise HTTPException(status_code=400, detail="No store selected. Please select a store.")
+
+    channels = get_sale_channels(store_id=store_id)
+    normalized = []
+    for ch in channels or []:
+        gid = str(ch.get("id", "") or "")
+        ch_id = gid.rsplit("/", 1)[-1] if gid else ""
+        if not ch_id:
+            continue
+        normalized.append({
+            "id": ch_id,
+            "gid": gid,
+            "name": ch.get("name") or ch_id,
+        })
+    return {"sale_channels": normalized}
+
+
 @router.get("/resources")
 async def list_resources(request: Request):
     store_name = get_current_store_name(request)
@@ -418,6 +698,30 @@ async def delete_resource(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting file: {e}")
 
+@router.get("/resources/preview/{filename}")
+async def preview_resource(
+    request: Request,
+    filename: str = Path(..., description="The name of the uploaded file to preview"),
+    rows: int = Query(20, ge=1, le=100, description="Maximum number of rows to return"),
+):
+    """Return the first rows of an uploaded Excel/CSV file as JSON."""
+    store_name = get_current_store_name(request)
+    if not store_name:
+        raise HTTPException(status_code=400, detail="No store selected. Please select a store.")
+
+    resources_dir = os.path.join(PROJECT_ROOT, "resources", store_name)
+    safe_filename, file_path = _safe_store_file_path(resources_dir, filename)
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    try:
+        return JSONResponse(_resource_preview(file_path, rows))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Cannot preview file: {exc}")
+
+
 @router.get("/resources/{filename}")
 async def download_resource(
     request: Request,
@@ -443,7 +747,9 @@ async def download_resource(
 @router.get("/check/{filename}")
 async def check_file_structure(
     request: Request,
-    filename: str = Path(..., description="The name of the file to check")
+    filename: str = Path(..., description="The name of the file to check"),
+    location_id: str = Query(None, description="Global location ID override/fallback"),
+    sale_channels: str = Query(None, description="Global sale channel IDs (comma-separated)"),
 ):
     """Validate a file and return a detailed preflight report."""
     store_name = get_current_store_name(request)
@@ -470,15 +776,21 @@ async def check_file_structure(
 
         df.columns = [normalize_text(col) for col in df.columns.str.lower()]
 
+        global_location_id = _normalize_location_id(location_id)
+        global_sale_channel_ids = _normalize_sale_channel_ids(sale_channels)
+
         has_location_in_file = any(col in LOCATION_COLUMNS for col in df.columns)
         has_sale_channel_in_file = any(col in SALE_CHANNEL_COLUMNS for col in df.columns)
         has_quantity_in_file = any(col in ('qta', 'quantity', 'qty') for col in df.columns)
         has_product_ref_in_file = any(col in ('sku', 'barcode') for col in df.columns)
 
+        has_location = has_location_in_file or bool(global_location_id)
+        has_sale_channel = has_sale_channel_in_file or bool(global_sale_channel_ids)
+
         missing_fields = []
-        if not has_location_in_file:
+        if not has_location:
             missing_fields.append("location_id")
-        if not has_sale_channel_in_file:
+        if not has_sale_channel:
             missing_fields.append("sale_channel")
         if not has_quantity_in_file:
             missing_fields.append("quantity")
@@ -487,7 +799,7 @@ async def check_file_structure(
 
         if missing_fields:
             return _check_payload(
-                filename, df.columns, has_location_in_file, has_sale_channel_in_file,
+                filename, df.columns, has_location, has_sale_channel,
                 False, f"File is missing required fields: {', '.join(missing_fields)}",
                 missing_fields=missing_fields,
             )
@@ -507,7 +819,7 @@ async def check_file_structure(
         )
         if not product_variants:
             return _check_payload(
-                filename, df.columns, has_location_in_file, has_sale_channel_in_file,
+                filename, df.columns, has_location, has_sale_channel,
                 False, "No matching product variants found in Shopify.",
                 total_skus=len(data_records),
                 identifier_type=identifier_type,
@@ -554,10 +866,15 @@ async def check_file_structure(
             quantity_number = _quantity_number(quantity_raw)
             quantity_display = "" if _is_blank(quantity_raw) else str(quantity_raw)
 
-            location_id = _normalize_location_id(row.get(location_col))
-            channel_raw = row.get(channel_col)
-            channel_value = "" if _is_blank(channel_raw) else str(channel_raw).strip()
-            channels_in_row = [c.strip() for c in channel_value.split(",") if c.strip()]
+            row_location_id = _normalize_location_id(row.get(location_col)) if location_col else None
+            location_id = row_location_id or global_location_id
+            location_source = "file" if row_location_id else ("global" if global_location_id else "missing")
+
+            channel_raw = row.get(channel_col) if channel_col else None
+            row_channel_ids = _normalize_sale_channel_ids(channel_raw)
+            effective_channel_ids = row_channel_ids if row_channel_ids else global_sale_channel_ids
+            channel_value = ",".join(effective_channel_ids)
+            channel_source = "file" if row_channel_ids else ("global" if global_sale_channel_ids else "missing")
 
             variant = variant_map.get(ref)
             inventory_item_id = ""
@@ -567,7 +884,7 @@ async def check_file_structure(
                 matched_item_ids.append(inventory_item_id)
             if location_id:
                 location_ids.append(location_id)
-            channel_ids.extend(channels_in_row)
+            channel_ids.extend(effective_channel_ids)
 
             product = (variant or {}).get("product") or {}
             product_gid = product.get("id") or ""
@@ -578,7 +895,9 @@ async def check_file_structure(
                 "quantity_number": quantity_number,
                 "location_id": location_id,
                 "location_name": location_names.get(location_id, ""),
+                "location_source": location_source,
                 "sale_channel": channel_value,
+                "sale_channel_source": channel_source,
                 "matched": variant is not None,
                 "product_id": product_gid.rsplit("/", 1)[-1] if product_gid else "",
                 "variant_title": (variant or {}).get("title", ""),
@@ -641,6 +960,13 @@ async def check_file_structure(
         def warn(message, level="warning"):
             warnings.append({"level": level, "message": message})
 
+        if global_location_id:
+            loc_name = location_names.get(global_location_id, global_location_id)
+            warn(f"Global location default: {loc_name} ({global_location_id}).", "info")
+        if global_sale_channel_ids:
+            ch_labels = [f"{channel_names.get(cid, cid)} ({cid})" for cid in global_sale_channel_ids]
+            warn(f"Global sale channels default: {', '.join(ch_labels)}.", "info")
+
         if unique_location_ids:
             known_locations = [lid for lid in unique_location_ids if lid in location_names]
             if locations:
@@ -654,16 +980,16 @@ async def check_file_structure(
                     f"{', '.join(unique_location_ids)}. Sync will be refused.",
                     "error",
                 )
-            elif len(known_locations) == 1:
+            elif len(known_locations) == 1 and not global_location_id:
                 warn(
                     f"Target location: {location_names[known_locations[0]]} "
                     f"({known_locations[0]}).",
                     "info",
                 )
         else:
-            warn("No location ID was found in the file.", "error")
+            warn("No location ID was found in the file or global settings.", "error")
 
-        if locations and channel_ids:
+        if channel_ids:
             for cid in unique_channel_ids:
                 if cid not in channel_names:
                     warn(f"Sale channel {cid} was not found in this store.")
@@ -711,14 +1037,20 @@ async def check_file_structure(
                 {"id": cid, "name": channel_names.get(cid, ""), "known": cid in channel_names}
                 for cid in unique_channel_ids
             ],
+            "global_location_id": global_location_id,
+            "global_sale_channels": global_sale_channel_ids,
         }
 
-        ready_to_sync = not missing_rows and not duplicate_rows
+        ready_to_sync = not missing_rows and not duplicate_rows and len(unique_location_ids) <= 1
+        detail = "File is ready to sync!" if ready_to_sync else (
+            f"File has {len(missing_rows)} missing SKUs and {len(duplicate_rows)} duplicate SKUs."
+            if (missing_rows or duplicate_rows)
+            else "File cannot be synced due to location/channel configuration issues."
+        )
         return _check_payload(
-            filename, df.columns, has_location_in_file, has_sale_channel_in_file,
+            filename, df.columns, has_location, has_sale_channel,
             ready_to_sync,
-            "File is ready to sync!" if ready_to_sync
-            else f"File has {len(missing_rows)} missing SKUs and {len(duplicate_rows)} duplicate SKUs.",
+            detail,
             total_skus=len(data_records),
             identifier_type=identifier_type,
             missing_rows=missing_rows,
@@ -740,7 +1072,8 @@ async def update_file_with_data(
     request: Request,
     filename: str = Path(..., description="The name of the file to update"),
     location_id: str = Form(None, description="The location ID to add to the file"),
-    sale_channel: str = Form(None, description="The sale channel to add to the file")
+    sale_channel: str = Form(None, description="The sale channel to add to the file"),
+    sale_channels: list[str] = Form(None, description="Sale channel IDs to add to the file"),
 ):
     """Add missing location_id and sale_channel columns to the file"""
     store_name = get_current_store_name(request)
@@ -776,9 +1109,11 @@ async def update_file_with_data(
 
         sale_channel_action = "unchanged"
         previous_sale_channels = []
-        if sale_channel:
+        requested_channels = sale_channels if sale_channels is not None else sale_channel
+        formatted_channels = _format_sale_channel_ids(requested_channels)
+        if formatted_channels:
             df, sale_channel_action, previous_sale_channels = _apply_requested_column_value(
-                df, SALE_CHANNEL_COLUMNS, "canale di vendita", sale_channel
+                df, SALE_CHANNEL_COLUMNS, "canale di vendita", formatted_channels
             )
         sale_channel_column = next((c for c in SALE_CHANNEL_COLUMNS if c in df.columns), None)
 
@@ -792,7 +1127,7 @@ async def update_file_with_data(
             "detail": f"File '{filename}' updated successfully",
             "added_columns": {
                 "location_id": location_id if location_action in ("added", "overwritten") else None,
-                "sale_channel": sale_channel if sale_channel_action in ("added", "overwritten") else None,
+                "sale_channel": formatted_channels if sale_channel_action in ("added", "overwritten") else None,
             },
             "location_column": {
                 "name": location_column,
@@ -813,7 +1148,10 @@ async def update_file_with_data(
 async def sync_file(
     request: Request,
     filename: str = Path(..., description="The name of the file to sync"),
-    sync_mode: str = Form("adjust", description="Sync mode: tabula_rasa, adjust, or replace")
+    sync_mode: str = Form("adjust", description="Sync mode: tabula_rasa, adjust, or replace"),
+    location_id: str = Form(None, description="Global location ID fallback/override"),
+    sale_channels: list[str] = Form(None, description="Global sale channel IDs fallback/override"),
+    sale_channel: str = Form(None, description="Global sale channel IDs as comma-separated string"),
 ):
     store_name = get_current_store_name(request)
     if not store_name:
@@ -862,6 +1200,10 @@ async def sync_file(
             # Pass data to the sync function with store_id and sync_mode
             data_records = df.to_dict(orient="records")
             total_records = len(data_records)
+
+            global_location_id = _normalize_location_id(location_id)
+            requested_channels = sale_channels if sale_channels is not None else sale_channel
+            global_sale_channel_ids = _normalize_sale_channel_ids(requested_channels)
             
             yield f"data: {json.dumps({'type': 'start', 'total': total_records, 'mode': sync_mode})}\n\n"
             await asyncio.sleep(0.01)
@@ -886,6 +1228,8 @@ async def sync_file(
                     sync_mode,
                     store_name,
                     filename,
+                    global_location_id,
+                    global_sale_channel_ids,
                 )
                 
                 # Show progress while waiting

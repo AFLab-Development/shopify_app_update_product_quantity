@@ -1,4 +1,13 @@
 import os
+
+try:
+    import certifi
+
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+except Exception:
+    pass
+
 import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request

@@ -1,6 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildSummary, buildReport, targetText } = require('../app/views/static/check_report.js');
+const {
+    buildSummary, buildReport, buildStatus, buildNotice, normalizeIssues, targetText,
+} = require('../app/views/static/check_report.js');
 
 function data(overrides = {}) {
     const row = (i) => ({
@@ -94,4 +96,97 @@ test('escapes untrusted values in warnings and rows', () => {
     assert.doesNotMatch(html, /<img src=x>/);
     assert.match(html, /&lt;script&gt;/);
     assert.match(html, /&lt;img src=x&gt;/);
+});
+
+test('summary can leave warnings to the status card', () => {
+    assert.match(buildSummary(data(), 'x.xlsx'), /report-warning--info/);
+    assert.doesNotMatch(buildSummary(data(), 'x.xlsx', { showWarnings: false }), /report-warning/);
+});
+
+test('blocking status card renders actionable issues without inline handlers', () => {
+    const d = data({
+        ready_to_sync: false,
+        issues: [
+            {
+                code: 'missing_skus', severity: 'blocking',
+                title: '2 SKUs not found in Shopify',
+                explanation: "These products don't exist in the selected store.",
+                fix: 'Correct the SKU/barcode.', count: 2, items: ['ABC', 'DEF'],
+            },
+            {
+                code: 'duplicate_skus', severity: 'blocking',
+                title: '1 duplicate SKU in the file',
+                explanation: 'These SKUs appear more than once.',
+                fix: 'Keep one row per SKU.', count: 1, items: ['XYZ'],
+            },
+        ],
+    });
+    const html = buildStatus(d, 'file.xlsx');
+    assert.match(html, /check-status--blocked/);
+    assert.match(html, /role="alert"/);
+    assert.match(html, /How to fix:<\/strong> Correct the SKU\/barcode\./);
+    assert.match(html, /data-copy-issue="0"/);
+    assert.match(html, /issue-items--preview/);
+    assert.doesNotMatch(html, /onclick=/);
+    assert.match(html, /View detailed report/);
+});
+
+test('long SKU lists are collapsed behind a Show all toggle', () => {
+    const d = data({
+        ready_to_sync: false,
+        issues: [{
+            code: 'missing_skus', severity: 'blocking',
+            title: '6 SKUs not found in Shopify', count: 6,
+            items: ['A', 'B', 'C', 'D', 'E', 'F'],
+        }],
+    });
+    const html = buildStatus(d, 'file.xlsx', { showDetails: false });
+    assert.match(html, /data-toggle-issue="0"/);
+    assert.match(html, /data-collapsed-label="Show all 6"/);
+    assert.match(html, /id="issue-items-0" hidden/);
+});
+
+test('ready status card keeps the report open', () => {
+    const html = buildStatus(data(), 'ok.xlsx', { detailsOpen: true });
+    assert.match(html, /check-status--ready/);
+    assert.match(html, /<details class="check-status__details" open>/);
+    assert.match(html, /File preview/);
+});
+
+test('status card escapes untrusted issue text and SKUs', () => {
+    const d = data({
+        ready_to_sync: false,
+        issues: [{
+            code: 'missing_skus', severity: 'blocking',
+            title: '<img src=x>', explanation: '<script>alert(1)</script>',
+            fix: '<b>do this</b>', items: ['A&<B>'],
+        }],
+    });
+    const html = buildStatus(d, '<file>.xlsx', { showDetails: false });
+    assert.doesNotMatch(html, /<script>/);
+    assert.doesNotMatch(html, /<img src=x>/);
+    assert.match(html, /&lt;img src=x&gt;/);
+    assert.match(html, /A&amp;&lt;B&gt;/);
+    assert.doesNotMatch(html, /View detailed report/);
+});
+
+test('shared notice escapes text and keeps the blocking role', () => {
+    const html = buildNotice({
+        severity: 'blocked', title: 'Could not load logs',
+        message: '<script>alert(1)</script>', fix: 'Try refreshing.',
+    });
+    assert.match(html, /check-status--blocked app-notice/);
+    assert.match(html, /role="alert"/);
+    assert.match(html, /&lt;script&gt;/);
+    assert.doesNotMatch(html, /<script>/);
+});
+
+test('legacy check payload without issues still renders a blocking card', () => {
+    const d = data({ ready_to_sync: false, issues: undefined, missing_rows: ['OLD-SKU'] });
+    const html = buildStatus(d, 'old.xlsx', { showDetails: false });
+    assert.match(html, /check-status--blocked/);
+    assert.match(html, /OLD-SKU/);
+    const issues = normalizeIssues(d);
+    assert.equal(issues[0].code, 'missing_skus');
+    assert.equal(issues[0].severity, 'blocking');
 });

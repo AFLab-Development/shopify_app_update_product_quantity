@@ -8,6 +8,21 @@
 </head>
 <body>
     <header>
+        {% if store_name %}
+            <div class="store-badge">{{ store_name }}</div>
+        {% endif %}
+        <div class="header-middle">
+            <h1>FORCE QUANTITY</h1>
+            <nav>
+                <ul>
+                    <li><a href="{{ request.scope.root_path }}/" class="{% if page == 'home' %}active{% endif %}">Files</a></li>
+                    <li><a href="{{ request.scope.root_path }}/logs" class="{% if page == 'logs' %}active{% endif %}">Logs</a></li>
+                </ul>
+            </nav>
+        </div>
+        <div class="header-bottom">
+            <span class="api-version-display">{% if api_version %}API Version: {{ api_version }}{% endif %}</span>
+        </div>
         <div class="header-top">
             {% block header_store_select %}
             <div class="header-store-select">
@@ -17,6 +32,24 @@
                     <option value="{{ store_id }}" data-store-name="{% if store_config.title %}{{ store_config.title }}{% else %}{{ store_config.store_name }}{% endif %}">{% if store_config.title %}{{ store_config.title }}{% else %}{{ store_config.store_name }}{% endif %}</option>
                     {% endfor %}
                 </select>
+                <div class="global-store-config" id="global-store-config" style="{% if not current_store %}display:none;{% endif %}">
+                    <div class="global-config-field" id="global-location-field">
+                        <label for="global-location-select">Location (ID Sede)</label>
+                        <select id="global-location-select">
+                            <option value="">Use file location / select location</option>
+                        </select>
+                        <div class="global-config-error" id="global-location-error" aria-live="polite"></div>
+                    </div>
+                    <div class="global-config-field global-config-field-channels" id="global-sale-channels-field">
+                        <span class="global-config-label" id="global-sale-channels-label">Sale Channels</span>
+                        <div class="multi-select" id="global-sale-channels">
+                            <button type="button" class="multi-select-toggle" id="global-sale-channels-toggle" aria-expanded="false" aria-labelledby="global-sale-channels-label global-sale-channels-toggle">Select sale channels</button>
+                            <div class="multi-select-panel" id="global-sale-channels-panel" hidden></div>
+                        </div>
+                        <div class="global-config-error" id="global-sale-channels-error" aria-live="polite"></div>
+                        <small class="global-config-hint">Open to select one or more channels.</small>
+                    </div>
+                </div>
             </div>
             <script>
                 function handleStoreChange(select) {
@@ -58,21 +91,7 @@
             </script>
             {% endblock %}
         </div>
-        {% if store_name %}
-            <div class="store-badge">{{ store_name }}</div>
-        {% endif %}
-        <div class="header-middle">
-            <h1>FORCE QUANTITY</h1>
-            <nav>
-                <ul>
-                    <li><a href="{{ request.scope.root_path }}/" class="{% if page == 'home' %}active{% endif %}">Files</a></li>
-                    <li><a href="{{ request.scope.root_path }}/logs" class="{% if page == 'logs' %}active{% endif %}">Logs</a></li>
-                </ul>
-            </nav>
-        </div>
-        <div class="header-bottom">
-            <span class="api-version-display">{% if api_version %}API Version: {{ api_version }}{% endif %}</span>
-        </div>
+
     </header>
     <main>
         {% block content %}{% endblock %}

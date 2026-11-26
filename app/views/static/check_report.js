@@ -57,7 +57,7 @@
         return html;
     }
 
-    function buildSummary(data, filename) {
+    function buildSummary(data, filename, options = {}) {
         const summary = data.summary || {};
         if (!summary.rows) return "";
 
@@ -75,7 +75,7 @@
                     <div class="report-tile"><span>Total quantity</span><strong>${escapeHtml(totalText)}</strong></div>
                 </div>
                 <div class="report-target"><strong>Target location:</strong> ${escapeHtml(targetText(data))}</div>
-                ${warningsHtml(data)}
+                ${options.showWarnings === false ? "" : warningsHtml(data)}
             </div>
         `;
     }
@@ -119,8 +119,8 @@
         return html;
     }
 
-    function buildReport(data, filename) {
-        let html = buildSummary(data, filename);
+    function buildReport(data, filename, options = {}) {
+        let html = buildSummary(data, filename, options);
         const preview = data.preview || [];
         const rows = data.rows || [];
 
@@ -145,5 +145,199 @@
         return buildSummary(data, filename);
     }
 
-    return { build, buildSummary, buildReport, rowsTable, targetText, escapeHtml, currentStockText };
+    const SEVERITIES = ["blocking", "warning", "info"];
+
+    function normalizeIssue(issue, index) {
+        const items = Array.isArray(issue && issue.items)
+            ? issue.items.map(item => String(item))
+            : [];
+        const severity = SEVERITIES.includes(issue && issue.severity)
+            ? issue.severity
+            : "warning";
+        return {
+            code: String((issue && issue.code) || `issue_${index}`),
+            severity,
+            title: String((issue && (issue.title || issue.message)) || "Preflight issue"),
+            explanation: String((issue && issue.explanation) || ""),
+            fix: String((issue && issue.fix) || ""),
+            items,
+            count: items.length || Number(issue && issue.count) || 1,
+        };
+    }
+
+    function legacyIssues(data) {
+        const issues = [];
+        const missingFields = data.missing_fields || [];
+        if (missingFields.length) {
+            issues.push({
+                code: "missing_columns", severity: "blocking",
+                title: "Required columns are missing",
+                explanation: "The file doesn't contain: " + missingFields.join(", ") + ".",
+                fix: "Add these columns or choose the global defaults above, then check again.",
+                items: missingFields,
+            });
+        }
+        if ((data.missing_rows || []).length) {
+            issues.push({
+                code: "missing_skus", severity: "blocking",
+                title: `${data.missing_rows.length} SKU(s) not found in Shopify`,
+                explanation: "These products don't exist in the selected store, so their quantities can't be updated.",
+                fix: "Correct the SKU/barcode, create the product in Shopify, or remove the row.",
+                items: data.missing_rows,
+            });
+        }
+        if ((data.duplicate_rows || []).length) {
+            issues.push({
+                code: "duplicate_skus", severity: "blocking",
+                title: `${data.duplicate_rows.length} duplicate SKU(s) in the file`,
+                explanation: "These SKUs appear more than once, so the app can't tell which quantity to apply.",
+                fix: "Keep one row per SKU, or merge the quantities into a single row.",
+                items: data.duplicate_rows,
+            });
+        }
+        (data.warnings || []).forEach((warning, index) => {
+            const level = warning.level || "warning";
+            issues.push({
+                code: `check_${level}_${index}`,
+                severity: level === "info" ? "info" : (level === "error" ? "blocking" : "warning"),
+                title: warning.message || "Preflight issue",
+                items: [],
+            });
+        });
+        if (!issues.length && !data.ready_to_sync) {
+            issues.push({
+                code: "check_blocked", severity: "blocking",
+                title: "This file can't be synced yet",
+                explanation: data.detail || "The file did not pass the preflight check.",
+                fix: "Review the report above and run Select & Check again.",
+                items: [],
+            });
+        }
+        return issues;
+    }
+
+    function normalizeIssues(data) {
+        if (Array.isArray(data && data.issues) && data.issues.length) {
+            return data.issues.map(normalizeIssue);
+        }
+        return legacyIssues(data || {}).map(normalizeIssue);
+    }
+
+    function copyNoun(issue) {
+        if (issue.code === "missing_columns") return "item";
+        if (issue.code === "missing_skus" || issue.code === "duplicate_skus") return "SKU";
+        if (issue.code === "no_shopify_matches") return "identifier";
+        return issue.count === 1 ? "item" : "items";
+    }
+
+    function issueHtml(issue, index) {
+        const icon = issue.severity === "info" ? "i" : "!";
+        const preview = issue.items.slice(0, 5);
+        const hasMore = issue.items.length > preview.length;
+        const previewHtml = preview.length ? `
+            <ul class="issue-items issue-items--preview">
+                ${preview.map(item => `<li><code>${escapeHtml(item)}</code></li>`).join("")}
+            </ul>` : "";
+        const fullHtml = issue.items.length ? `
+            <ol class="issue-items issue-items--all" id="issue-items-${index}" ${hasMore ? "hidden" : ""}>
+                ${issue.items.map(item => `<li><code>${escapeHtml(item)}</code></li>`).join("")}
+            </ol>` : "";
+        const copyButton = issue.items.length ? `
+            <button type="button" class="issue-btn issue-btn--copy" data-copy-issue="${index}">
+                Copy ${issue.count} ${copyNoun(issue)}${issue.count === 1 ? "" : "s"}
+            </button>` : "";
+        const toggleButton = hasMore ? `
+            <button type="button" class="issue-btn" data-toggle-issue="${index}"
+                    data-collapsed-label="Show all ${issue.items.length}"
+                    aria-expanded="false" aria-controls="issue-items-${index}">
+                Show all ${issue.items.length}
+            </button>` : "";
+
+        return `
+            <li class="issue-card issue-card--${issue.severity}">
+                <div class="issue-card__head">
+                    <span class="issue-card__icon" aria-hidden="true">${icon}</span>
+                    <div class="issue-card__heading">
+                        <h4>${escapeHtml(issue.title)}</h4>
+                        ${issue.items.length ? `<span class="issue-card__count">${issue.count}</span>` : ""}
+                    </div>
+                </div>
+                ${issue.explanation ? `<p class="issue-card__text">${escapeHtml(issue.explanation)}</p>` : ""}
+                ${issue.fix ? `<p class="issue-card__fix"><strong>How to fix:</strong> ${escapeHtml(issue.fix)}</p>` : ""}
+                ${previewHtml}
+                ${fullHtml}
+                ${copyButton || toggleButton ? `<div class="issue-card__actions">${copyButton}${toggleButton}</div>` : ""}
+            </li>`;
+    }
+
+    function buildStatus(data, filename, options = {}) {
+        const issues = normalizeIssues(data);
+        const blocking = issues.filter(issue => issue.severity === "blocking");
+        const warnings = issues.filter(issue => issue.severity === "warning");
+        const state = data && data.ready_to_sync
+            ? (warnings.length ? "attention" : "ready")
+            : (blocking.length ? "blocked" : "attention");
+        const headline = options.title || (
+            state === "ready" ? "Ready to sync"
+                : state === "blocked" ? "This file can't be synced yet"
+                    : "Check this file before syncing"
+        );
+        let subtitle = options.subtitle || "";
+        if (!subtitle) {
+            if (state === "ready") {
+                subtitle = `All ${data.total_skus || (data.summary && data.summary.rows) || 0} identifiers were verified in Shopify.`;
+            } else {
+                const parts = [];
+                if (blocking.length) parts.push(`${blocking.length} blocking issue${blocking.length === 1 ? "" : "s"}`);
+                if (warnings.length) parts.push(`${warnings.length} warning${warnings.length === 1 ? "" : "s"}`);
+                subtitle = `${parts.join(" and ") || "Preflight check did not pass"} for ${filename}.`;
+            }
+        }
+        const details = options.showDetails === false ? "" : `
+            <details class="check-status__details" ${options.detailsOpen ? "open" : ""}>
+                <summary>View detailed report</summary>
+                ${buildReport(data, filename, { showWarnings: false })}
+            </details>`;
+
+        return `
+            <div class="check-status check-status--${state}" data-check-status tabindex="-1"
+                 role="${state === "blocked" ? "alert" : "status"}"
+                 ${state === "blocked" ? "" : 'aria-live="polite"'}>
+                <div class="check-status__header">
+                    <span class="check-status__icon" aria-hidden="true">${state === "ready" ? "✓" : state === "blocked" ? "!" : "?"}</span>
+                    <div>
+                        <h3 class="check-status__title">${escapeHtml(headline)}</h3>
+                        <p class="check-status__subtitle">${escapeHtml(subtitle)}</p>
+                    </div>
+                </div>
+                ${issues.length ? `<ul class="issue-list">${issues.map(issueHtml).join("")}</ul>` : ""}
+                ${details}
+            </div>`;
+    }
+
+    function buildNotice(notice) {
+        const noticeData = notice || {};
+        const severity = ["blocked", "warning", "info", "ready"].includes(noticeData.severity)
+            ? noticeData.severity
+            : "blocked";
+        const icon = severity === "ready" ? "✓" : (severity === "info" ? "i" : "!");
+        return `
+            <div class="check-status check-status--${severity} app-notice"
+                 role="${severity === "blocked" ? "alert" : "status"}"
+                 ${severity === "blocked" ? "" : 'aria-live="polite"'}>
+                <div class="check-status__header">
+                    <span class="check-status__icon" aria-hidden="true">${icon}</span>
+                    <div>
+                        <h3 class="check-status__title">${escapeHtml(noticeData.title || "Something went wrong")}</h3>
+                        ${noticeData.message ? `<p class="check-status__subtitle">${escapeHtml(noticeData.message)}</p>` : ""}
+                        ${noticeData.fix ? `<p class="issue-card__fix"><strong>How to fix:</strong> ${escapeHtml(noticeData.fix)}</p>` : ""}
+                    </div>
+                </div>
+            </div>`;
+    }
+
+    return {
+        build, buildSummary, buildReport, buildStatus, buildNotice, normalizeIssues,
+        rowsTable, targetText, escapeHtml, currentStockText,
+    };
 });

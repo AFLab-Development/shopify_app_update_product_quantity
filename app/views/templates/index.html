@@ -3,26 +3,14 @@
 {% block title %}Home{% endblock %}
 
 {% block content %}
-<div class="card" id="sync-config" style="display: none;">
-    <h2>Missing Required Data</h2>
-    <p style="color: #bdbdbd; font-size: 1.2rem; margin-bottom: 1em;">
-        Please provide the missing information for this file:
-    </p>
-    <div style="margin-bottom: 1em;">
-        <div id="location-field" style="display: none; margin-bottom: 10px;">
-            <label for="location-id">Location ID (ID Sede):</label>
-            <input type="text" id="location-id" placeholder="e.g. 101947474247" style="margin-left: 10px; padding: 8px; width: 200px;">
-        </div>
-        
-        <div id="sale-channel-field" style="display: none; margin-bottom: 10px;">
-            <label for="sale-channel">Sale Channel (Canale di Vendita):</label>
-            <input type="text" id="sale-channel" placeholder="e.g. 176929734983" style="margin-left: 10px; padding: 8px; width: 200px;">
-        </div>
-        
-        <button id="save-and-sync" style="display: none; margin-top: 10px; background: var(--color-primary); color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer;">
-            Save to File & Sync
-        </button>
-    </div>
+<div class="card" id="sync-config" style="display: none;"></div>
+
+<div class="card" id="upload-section" style="{% if not current_store %}display: none;{% endif %}">
+    <h2> UploadFile </h2>
+    <form method="POST" action="{{ request.scope.root_path }}/api/v1/uploadFile" enctype="multipart/form-data" id="UploadFile" style="margin-bottom: 1em;">
+        <input type="file" id="file" name="file" accept=".csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+        <button type="submit">UPLOAD</button>
+    </form>
 </div>
 
 <div class="card" id="files-section" style="{% if not current_store %}display: none;{% endif %}">
@@ -32,13 +20,24 @@
     </ul>
 </div>
 
-<div class="card" id="upload-section" style="{% if not current_store %}display: none;{% endif %}">
-    <h2> UploadFile </h2>
-    <form method="POST" action="{{ request.scope.root_path }}/api/v1/uploadFile" enctype="multipart/form-data" id="UploadFile" style="margin-bottom: 1em;">
-        <input type="file" id="file" name="file" accept=".csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
-        <button type="submit">UPLOAD</button>
-    </form>
-    <pre class="box" style="max-width:100%">Here should be data returned from API response</pre>
+<div class="card" id="results" tabindex="-1" style="{% if not current_store %}display: none;{% endif %}">
+    <h2>Results &amp; Errors</h2>
+    <div class="box response-box" id="check-results">Select a file and run “Select &amp; Check” to see the report here.</div>
+</div>
+
+<div class="log-modal" id="file-modal" hidden>
+    <div class="log-modal__backdrop" data-close-file-modal></div>
+    <div class="log-modal__panel" role="dialog" aria-modal="true" aria-labelledby="file-modal-title">
+        <div class="logs-toolbar">
+            <h2 id="file-modal-title">File Preview</h2>
+            <div class="logs-toolbar-actions">
+                <button id="file-modal-download" class="view-log-btn">Download</button>
+                <button id="file-modal-close" class="delete-all-logs" data-close-file-modal>Close</button>
+            </div>
+        </div>
+        <div id="file-modal-notice" class="logs-notice" aria-live="polite"></div>
+        <div class="box response-box" id="file-modal-content">Loading...</div>
+    </div>
 </div>
 
 <script>

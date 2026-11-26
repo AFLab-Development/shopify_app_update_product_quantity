@@ -40,6 +40,48 @@ class CheckPayloadTests(unittest.TestCase):
         self.assertEqual(payload["missing_rows"], [])
         self.assertEqual(payload["duplicate_rows"], [])
 
+    def test_missing_fields_issue_is_actionable(self):
+        payload = _check_payload(
+            "file.xlsx", ["sku"], False, False, False,
+            "File is missing required fields: location_id",
+            missing_fields=["location_id"],
+        )
+        issue = payload["issues"][0]
+        self.assertEqual(issue["code"], "missing_columns")
+        self.assertEqual(issue["severity"], "blocking")
+        self.assertEqual(issue["items"], ["location"])
+        self.assertTrue(issue["fix"])
+
+    def test_check_payload_exposes_structured_issues(self):
+        payload = _check_payload(
+            "file.xlsx",
+            ["sku", "qta", "id sede", "canale di vendita"],
+            True, True, False, "File has 2 missing SKUs and 1 duplicate SKU.",
+            missing_rows=["AAA", "BBB"],
+            duplicate_rows=["CCC"],
+            warnings=[
+                {
+                    "level": "error",
+                    "message": "The file targets 2 different locations: 1, 2. Sync will be refused.",
+                },
+                {"level": "info", "message": "Global location default: Napoli (1)."},
+            ],
+        )
+        issues = payload["issues"]
+        self.assertEqual(
+            [issue["code"] for issue in issues],
+            ["missing_skus", "duplicate_skus", "mixed_locations", "check_info"],
+        )
+        self.assertEqual(issues[0]["severity"], "blocking")
+        self.assertEqual(issues[0]["items"], ["AAA", "BBB"])
+        self.assertEqual(issues[0]["count"], 2)
+        self.assertTrue(issues[0]["fix"])
+        self.assertEqual(issues[2]["severity"], "blocking")
+        self.assertEqual(issues[3]["severity"], "info")
+        for issue in issues:
+            for key in ("code", "severity", "title", "explanation", "fix", "count", "items"):
+                self.assertIn(key, issue)
+
     def test_stock_lookup_distinguishes_unstocked_from_error(self):
         # No ids / no location: nothing attempted, no error.
         self.assertEqual(get_available_quantities_at_location([], "gid://x"), ({}, False))

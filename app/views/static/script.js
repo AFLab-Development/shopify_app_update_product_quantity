@@ -1,11 +1,29 @@
 document.addEventListener("DOMContentLoaded", function () {
     const uploadForm = document.getElementById("UploadFile");
-    const responseBox = document.querySelector("pre.box");
+    const responseBox = document.getElementById("check-results");
+    const resultsSection = document.getElementById("results");
     const list = document.getElementById("resources-list");
     const syncConfig = document.getElementById("sync-config");
+    const fileModal = document.getElementById("file-modal");
+    const fileModalTitle = document.getElementById("file-modal-title");
+    const fileModalContent = document.getElementById("file-modal-content");
+    const fileModalNotice = document.getElementById("file-modal-notice");
+    const fileModalDownloadBtn = document.getElementById("file-modal-download");
+    const fileModalCloseBtn = document.getElementById("file-modal-close");
+    let fileModalTrigger = null;
+    let fileModalFilename = null;
 
     // Get selected store from localStorage
     const selectedStore = localStorage.getItem('selectedStore');
+    const globalLocationSelect = document.getElementById('global-location-select');
+    const globalLocationField = document.getElementById('global-location-field');
+    const globalLocationError = document.getElementById('global-location-error');
+    const globalSaleChannelsContainer = document.getElementById('global-sale-channels');
+    const globalSaleChannelsField = document.getElementById('global-sale-channels-field');
+    const globalSaleChannelsToggle = document.getElementById('global-sale-channels-toggle');
+    const globalSaleChannelsPanel = document.getElementById('global-sale-channels-panel');
+    const globalSaleChannelsError = document.getElementById('global-sale-channels-error');
+    const globalStoreConfig = document.getElementById('global-store-config');
 
     // Override fetch to add store header and root path prefix
     const originalFetch = window.fetch;
@@ -23,20 +41,226 @@ document.addEventListener("DOMContentLoaded", function () {
         return originalFetch(url, options);
     };
 
+    function getGlobalLocationStorageKey(storeId = selectedStore) {
+        return storeId ? `selectedLocation:${storeId}` : null;
+    }
+
+    function getGlobalSaleChannelsStorageKey(storeId = selectedStore) {
+        return storeId ? `selectedSaleChannels:${storeId}` : null;
+    }
+
+    function getSelectedGlobalLocationId() {
+        const key = getGlobalLocationStorageKey();
+        if (!key) return '';
+        return localStorage.getItem(key) || '';
+    }
+
+    function setSelectedGlobalLocationId(locationId) {
+        const key = getGlobalLocationStorageKey();
+        if (!key) return;
+        if (locationId) localStorage.setItem(key, locationId);
+        else localStorage.removeItem(key);
+    }
+
+    function getSelectedGlobalSaleChannelIds() {
+        const key = getGlobalSaleChannelsStorageKey();
+        if (!key) return [];
+        try {
+            const parsed = JSON.parse(localStorage.getItem(key) || '[]');
+            return Array.isArray(parsed) ? parsed.map(String) : [];
+        } catch {
+            return [];
+        }
+    }
+
+    function setSelectedGlobalSaleChannelIds(ids) {
+        const key = getGlobalSaleChannelsStorageKey();
+        if (!key) return;
+        const normalized = Array.from(new Set((ids || []).map(String).filter(Boolean)));
+        if (normalized.length) localStorage.setItem(key, JSON.stringify(normalized));
+        else localStorage.removeItem(key);
+    }
+
+    function getGlobalConfigParams() {
+        const params = new URLSearchParams();
+        const locationId = getSelectedGlobalLocationId();
+        const saleChannels = getSelectedGlobalSaleChannelIds();
+        if (locationId) params.set('location_id', locationId);
+        if (saleChannels.length) params.set('sale_channels', saleChannels.join(','));
+        return params;
+    }
+
+    function appendGlobalConfigToFormData(formData) {
+        const locationId = getSelectedGlobalLocationId();
+        const saleChannels = getSelectedGlobalSaleChannelIds();
+        if (locationId) formData.append('location_id', locationId);
+        saleChannels.forEach(id => formData.append('sale_channels', id));
+        return formData;
+    }
+
+    function clearGlobalConfigErrors() {
+        globalLocationField?.classList.remove('has-error');
+        globalSaleChannelsField?.classList.remove('has-error');
+        if (globalLocationError) globalLocationError.textContent = '';
+        if (globalSaleChannelsError) globalSaleChannelsError.textContent = '';
+    }
+
+    function showGlobalConfigErrors(missingFields = []) {
+        clearGlobalConfigErrors();
+        const missing = new Set(missingFields || []);
+        if (missing.has('location_id')) {
+            globalLocationField?.classList.add('has-error');
+            if (globalLocationError) globalLocationError.textContent = 'Select a location or include it in the file.';
+        }
+        if (missing.has('sale_channel')) {
+            globalSaleChannelsField?.classList.add('has-error');
+            if (globalSaleChannelsError) globalSaleChannelsError.textContent = 'Select at least one sale channel or include it in the file.';
+        }
+    }
+
+    async function loadGlobalLocations() {
+        if (!globalLocationSelect || !selectedStore) return;
+        globalLocationSelect.innerHTML = '<option value="">Loading locations...</option>';
+        try {
+            const res = await fetch('/api/v1/store-locations');
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || 'Failed to load locations');
+            const locations = data.locations || [];
+            const selected = getSelectedGlobalLocationId();
+            globalLocationSelect.innerHTML = '<option value="">Use file location / select location</option>';
+            locations.forEach(loc => {
+                const opt = document.createElement('option');
+                opt.value = loc.id;
+                opt.textContent = loc.name ? `${loc.name} (${loc.id})` : loc.id;
+                if (String(loc.id) === String(selected)) opt.selected = true;
+                globalLocationSelect.appendChild(opt);
+            });
+            if (selected && !locations.some(l => String(l.id) === String(selected))) {
+                setSelectedGlobalLocationId('');
+            }
+        } catch (err) {
+            globalLocationSelect.innerHTML = '<option value="">Could not load locations</option>';
+            console.error('Failed to load locations:', err);
+        }
+    }
+
+    function updateGlobalSaleChannelsLabel() {
+        if (!globalSaleChannelsToggle) return;
+        const selected = getSelectedGlobalSaleChannelIds();
+        const labels = Array.from(globalSaleChannelsPanel?.querySelectorAll('input[type="checkbox"]:checked') || [])
+            .map(input => input.dataset.label || input.value);
+        if (!selected.length) {
+            globalSaleChannelsToggle.textContent = 'Select sale channels';
+            return;
+        }
+        if (labels.length <= 2) {
+            globalSaleChannelsToggle.textContent = labels.join(', ');
+        } else {
+            globalSaleChannelsToggle.textContent = `${labels.length} channels selected`;
+        }
+    }
+
+    function closeGlobalSaleChannels() {
+        if (!globalSaleChannelsPanel || !globalSaleChannelsToggle) return;
+        globalSaleChannelsPanel.hidden = true;
+        globalSaleChannelsToggle.setAttribute('aria-expanded', 'false');
+    }
+
+    function openGlobalSaleChannels() {
+        if (!globalSaleChannelsPanel || !globalSaleChannelsToggle) return;
+        globalSaleChannelsPanel.hidden = false;
+        globalSaleChannelsToggle.setAttribute('aria-expanded', 'true');
+    }
+
+    async function loadGlobalSaleChannels() {
+        if (!globalSaleChannelsPanel || !selectedStore) return;
+        globalSaleChannelsPanel.innerHTML = '<div class="multi-select-empty">Loading sale channels...</div>';
+        try {
+            const res = await fetch('/api/v1/sale-channels');
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || 'Failed to load sale channels');
+            const channels = data.sale_channels || [];
+            const selectedIds = new Set(getSelectedGlobalSaleChannelIds().map(String));
+            globalSaleChannelsPanel.innerHTML = '';
+            if (!channels.length) {
+                globalSaleChannelsPanel.innerHTML = '<div class="multi-select-empty">No sale channels found</div>';
+                updateGlobalSaleChannelsLabel();
+                return;
+            }
+            channels.forEach(ch => {
+                const label = document.createElement('label');
+                label.className = 'multi-select-option';
+                const input = document.createElement('input');
+                input.type = 'checkbox';
+                input.value = ch.id;
+                input.dataset.label = ch.name ? `${ch.name} (${ch.id})` : ch.id;
+                input.checked = selectedIds.has(String(ch.id));
+                input.addEventListener('change', () => {
+                    const ids = Array.from(globalSaleChannelsPanel.querySelectorAll('input[type="checkbox"]:checked')).map(i => i.value);
+                    setSelectedGlobalSaleChannelIds(ids);
+                    updateGlobalSaleChannelsLabel();
+                    if (ids.length) {
+                        globalSaleChannelsField?.classList.remove('has-error');
+                        if (globalSaleChannelsError) globalSaleChannelsError.textContent = '';
+                    }
+                });
+                const text = document.createElement('span');
+                text.textContent = input.dataset.label;
+                label.appendChild(input);
+                label.appendChild(text);
+                globalSaleChannelsPanel.appendChild(label);
+            });
+            const validIds = new Set(channels.map(c => String(c.id)));
+            const pruned = Array.from(selectedIds).filter(id => validIds.has(id));
+            const prunedSet = new Set(pruned);
+            globalSaleChannelsPanel.querySelectorAll('input[type="checkbox"]').forEach(i => {
+                i.checked = prunedSet.has(i.value);
+            });
+            setSelectedGlobalSaleChannelIds(pruned);
+            updateGlobalSaleChannelsLabel();
+        } catch (err) {
+            globalSaleChannelsPanel.innerHTML = '<div class="multi-select-empty">Could not load sale channels</div>';
+            console.error('Failed to load sale channels:', err);
+        }
+    }
+
+    if (globalLocationSelect) {
+        globalLocationSelect.addEventListener('change', function () {
+            setSelectedGlobalLocationId(this.value || '');
+            if (this.value) {
+                globalLocationField?.classList.remove('has-error');
+                if (globalLocationError) globalLocationError.textContent = '';
+            }
+        });
+    }
+
+    if (globalSaleChannelsToggle && globalSaleChannelsPanel) {
+        globalSaleChannelsToggle.addEventListener('click', function () {
+            if (globalSaleChannelsPanel.hidden) openGlobalSaleChannels();
+            else closeGlobalSaleChannels();
+        });
+        document.addEventListener('click', function (e) {
+            if (!globalSaleChannelsContainer?.contains(e.target)) closeGlobalSaleChannels();
+        });
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') closeGlobalSaleChannels();
+        });
+    }
+
     // Update storeSelected based on localStorage
     if (selectedStore) {
         window.storeSelected = true;
         // Show the file sections
         document.getElementById('files-section').style.display = 'block';
         document.getElementById('upload-section').style.display = 'block';
+        if (globalStoreConfig) globalStoreConfig.style.display = 'flex';
+        loadGlobalLocations();
+        loadGlobalSaleChannels();
     }
 
     // Store selector is now handled by inline script in base.html template
 
-    // These will be updated when the HTML is reset
-    let locationField = document.getElementById("location-field");
-    let saleChannelField = document.getElementById("sale-channel-field");
-    let saveAndSyncBtn = document.getElementById("save-and-sync");
+
 
     let selectedFile = null;
 
@@ -88,11 +312,13 @@ document.addEventListener("DOMContentLoaded", function () {
                 </div>
                 <div class="file-actions">
                     <button class="check-btn" data-filename="${encodeURIComponent(f)}">Select & Check</button>
+                    <button class="view-file-btn" data-filename="${encodeURIComponent(f)}">View</button>
                     <button class="download-btn" data-filename="${encodeURIComponent(f)}">Download</button>
                     <button class="del-btn" data-filename="${encodeURIComponent(f)}">Delete</button>
                 </div>
             </li>`;
         }).join("");
+        addViewFileButtonListeners();
         addCheckButtonListeners();
         addDownloadButtonListeners();
         addDeleteButtonListeners();
@@ -101,36 +327,267 @@ document.addEventListener("DOMContentLoaded", function () {
             window.Backups.attachFileBackups(list);
         }
     }
+    function showFileNotice(title, message, fix, target = "page") {
+        if (!window.CheckReport) {
+            return;
+        }
+        const notice = window.CheckReport.buildNotice({ severity: "blocked", title, message, fix });
+        if (target === "modal" && fileModalNotice) {
+            fileModalNotice.innerHTML = notice;
+        } else {
+            responseBox.innerHTML = notice;
+        }
+    }
+
+    function clearFileNotice(target = "page") {
+        if (target === "modal" && fileModalNotice) {
+            fileModalNotice.innerHTML = "";
+        } else if (target === "page") {
+            responseBox.innerHTML = "";
+        }
+    }
+
+    function buildPreviewTable(data) {
+        const wrap = document.createElement("div");
+        const hint = document.createElement("p");
+        hint.className = "report-hint";
+        hint.textContent = `Showing first ${data.row_count || 0} row(s)`
+            + (data.truncated ? " — download the file for all rows." : ".");
+        wrap.appendChild(hint);
+
+        if (!data.rows || !data.rows.length) {
+            const empty = document.createElement("p");
+            empty.className = "logs-empty";
+            empty.textContent = "This file has no rows.";
+            wrap.appendChild(empty);
+            return wrap;
+        }
+
+        const table = document.createElement("table");
+        table.className = "sync-table check-table file-preview-table";
+        const thead = document.createElement("thead");
+        const headerRow = document.createElement("tr");
+        data.columns.forEach(column => {
+            const th = document.createElement("th");
+            th.textContent = column;
+            headerRow.appendChild(th);
+        });
+        thead.appendChild(headerRow);
+        table.appendChild(thead);
+
+        const tbody = document.createElement("tbody");
+        data.rows.forEach(row => {
+            const tr = document.createElement("tr");
+            data.columns.forEach((_, index) => {
+                const td = document.createElement("td");
+                const value = row[index];
+                td.textContent = value === "" || value === null || value === undefined ? "—" : String(value);
+                tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        wrap.appendChild(table);
+        return wrap;
+    }
+
+    async function openFileModal(filename, trigger) {
+        if (!fileModal || !fileModalTitle || !fileModalContent) {
+            return;
+        }
+        fileModalTrigger = trigger || null;
+        fileModalFilename = filename;
+        fileModal.hidden = false;
+        document.body.classList.add("modal-open");
+        fileModalTitle.textContent = `File Preview — ${filename}`;
+        fileModalContent.textContent = "Loading preview...";
+        fileModalDownloadBtn.style.display = "inline-block";
+        clearFileNotice("modal");
+        fileModalCloseBtn?.focus();
+
+        try {
+            const res = await fetch(`/api/v1/resources/preview/${encodeURIComponent(filename)}?rows=20`);
+            const data = await res.json();
+            if (!res.ok) {
+                showFileNotice(
+                    "Couldn't preview this file",
+                    data.detail || `The server returned HTTP ${res.status}.`,
+                    "Download the file to inspect it, or try again.",
+                    "modal",
+                );
+                fileModalContent.textContent = "Preview unavailable.";
+                return;
+            }
+            fileModalContent.replaceChildren(buildPreviewTable(data));
+        } catch (err) {
+            showFileNotice(
+                "Couldn't preview this file",
+                String(err && err.message ? err.message : err),
+                "Check your connection and try again.",
+                "modal",
+            );
+            fileModalContent.textContent = "Preview unavailable.";
+        }
+    }
+
+    function closeFileModal() {
+        if (!fileModal) {
+            return;
+        }
+        fileModal.hidden = true;
+        document.body.classList.remove("modal-open");
+        clearFileNotice("modal");
+        fileModalContent.textContent = "Loading...";
+        fileModalFilename = null;
+        if (fileModalTrigger && document.contains(fileModalTrigger)) {
+            fileModalTrigger.focus();
+        }
+        fileModalTrigger = null;
+    }
+
+    function addViewFileButtonListeners() {
+        list.querySelectorAll(".view-file-btn").forEach(btn => {
+            btn.addEventListener("click", function () {
+                const filename = decodeURIComponent(this.getAttribute("data-filename"));
+                openFileModal(filename, this);
+            });
+        });
+    }
+
+    async function downloadFile(filename, target = "page") {
+        const url = `/api/v1/resources/${encodeURIComponent(filename)}?download=1`;
+        const selectedStore = localStorage.getItem('selectedStore');
+        try {
+            const res = await fetch(url, {
+                headers: selectedStore ? { 'X-Selected-Store': selectedStore } : {}
+            });
+            if (!res.ok) {
+                showFileNotice(
+                    "Couldn't download the file",
+                    (await res.text()) || `The server returned HTTP ${res.status}.`,
+                    "Check the file permissions and try again.",
+                    target,
+                );
+                return;
+            }
+            const blob = await res.blob();
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+                URL.revokeObjectURL(a.href);
+                a.remove();
+            }, 100);
+        } catch (err) {
+            showFileNotice(
+                "Couldn't download the file",
+                String(err && err.message ? err.message : err),
+                "Check your connection and try again.",
+                target,
+            );
+        }
+    }
+
     // Add event listeners to download buttons
     function addDownloadButtonListeners() {
         list.querySelectorAll(".download-btn").forEach(btn => {
             btn.addEventListener("click", async function () {
                 const filename = decodeURIComponent(this.getAttribute("data-filename"));
-                const url = `/api/v1/resources/${encodeURIComponent(filename)}?download=1`;
-                const selectedStore = localStorage.getItem('selectedStore');
-                try {
-                    const res = await fetch(url, {
-                        headers: selectedStore ? { 'X-Selected-Store': selectedStore } : {}
-                    });
-                    if (!res.ok) {
-                        alert("Download failed: " + (await res.text()));
-                        return;
-                    }
-                    const blob = await res.blob();
-                    const a = document.createElement('a');
-                    a.href = URL.createObjectURL(blob);
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    setTimeout(() => {
-                        URL.revokeObjectURL(a.href);
-                        a.remove();
-                    }, 100);
-                } catch (err) {
-                    alert("Download error: " + err);
-                }
+                await downloadFile(filename);
             });
         });
+    }
+
+    // Copy / expand handlers for the preflight status card.
+    let currentCheckIssues = [];
+
+    async function copyText(text) {
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+                return true;
+            }
+        } catch (err) {
+            // Fall back to the legacy copy path below.
+        }
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+            return document.execCommand("copy");
+        } finally {
+            textarea.remove();
+        }
+    }
+
+    responseBox.addEventListener("click", async (event) => {
+        const toggle = event.target.closest("[data-toggle-issue]");
+        if (toggle) {
+            const index = Number(toggle.getAttribute("data-toggle-issue"));
+            const card = toggle.closest(".issue-card");
+            const full = responseBox.querySelector(`#issue-items-${index}`);
+            const preview = card && card.querySelector(".issue-items--preview");
+            const expanded = toggle.getAttribute("aria-expanded") === "true";
+            if (full) full.hidden = expanded;
+            if (preview) preview.hidden = !expanded;
+            toggle.setAttribute("aria-expanded", String(!expanded));
+            toggle.textContent = expanded ? toggle.dataset.collapsedLabel : "Show less";
+            return;
+        }
+
+        const copyButton = event.target.closest("[data-copy-issue]");
+        if (copyButton) {
+            const issue = currentCheckIssues[Number(copyButton.getAttribute("data-copy-issue"))];
+            if (!issue || !issue.items.length) return;
+            const originalLabel = copyButton.textContent;
+            const copied = await copyText(issue.items.join("\n"));
+            copyButton.textContent = copied ? "Copied ✓" : "Copy failed";
+            setTimeout(() => { copyButton.textContent = originalLabel; }, 1800);
+        }
+    });
+
+    function focusCheckStatus() {
+        responseBox.querySelector("[data-check-status]")?.focus({ preventScroll: true });
+    }
+
+    function revealResults() {
+        if (!resultsSection || !resultsSection.scrollIntoView) {
+            return;
+        }
+        const reduceMotion = window.matchMedia
+            && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        resultsSection.scrollIntoView({
+            behavior: reduceMotion ? "auto" : "smooth",
+            block: "start",
+        });
+    }
+
+    function renderCheckError(filename, title, message, fix) {
+        const data = {
+            ready_to_sync: false,
+            issues: [{
+                code: "check_request_failed",
+                severity: "blocking",
+                title: title,
+                explanation: message,
+                fix: fix || "Try the check again.",
+                items: [],
+            }],
+        };
+        currentCheckIssues = window.CheckReport.normalizeIssues(data);
+        responseBox.innerHTML = window.CheckReport.buildStatus(data, filename, {
+            showDetails: false,
+            title: title,
+            subtitle: "The preflight check could not be completed.",
+        });
+        revealResults();
+        focusCheckStatus();
     }
 
     // Check file structure and show configuration if needed
@@ -139,183 +596,69 @@ document.addEventListener("DOMContentLoaded", function () {
             // Reset the sync config panel first
             resetSyncConfig();
 
-            const res = await fetch(`/api/v1/check/${filename}`, { method: "GET" });
-            const data = await res.json();
+            const params = getGlobalConfigParams();
+            const query = params.toString();
+            const url = query ? `/api/v1/check/${filename}?${query}` : `/api/v1/check/${filename}`;
+            const res = await fetch(url, { method: "GET" });
 
-            if (res.ok) {
-                selectedFile = filename;
-
-                if (data.ready_to_sync) {
-                    // File has all required data and NO errors/warnings - show sync button in list
-                    showSyncModeSelection();
-                    addSyncButtonToListItem(filename);
-                    const safeFilename = window.CheckReport.escapeHtml(filename);
-                    responseBox.innerHTML = `<div style="color: var(--color-primary);">✓ File "${safeFilename}" is ready to sync!<br>All ${data.total_skus || 0} SKUs verified in Shopify.</div>`
-                        + window.CheckReport.build(data, filename);
-                } else {
-                    // File has errors or warnings - DO NOT allow syncing
-                    // Check if the issue is missing fields or missing/duplicate SKUs
-                    if (data.missing_fields && data.missing_fields.length > 0) {
-                        // File is missing required columns
-                        showMissingFieldsConfig(data);
-                        responseBox.innerHTML = window.CheckReport.buildSummary(data, filename)
-                            + `<div style="color: var(--color-highlight);">⚠ File "${window.CheckReport.escapeHtml(filename)}" is missing required columns.<br>Please fill in the missing information below.</div>`;
-                    } else if ((data.missing_rows && data.missing_rows.length > 0) || (data.duplicate_rows && data.duplicate_rows.length > 0)) {
-                        // File has missing or duplicate SKUs - Show report ONLY, NO sync button
-                        responseBox.innerHTML = window.CheckReport.buildSummary(data, filename) + `
-                            <div style="color: var(--color-error); padding: 20px; background: #2a1a1a; border-radius: 8px; border: 2px solid var(--color-error);">
-                                <h3 style="margin-top: 0; color: var(--color-error);">❌ Cannot Sync - File Has Errors</h3>
-                                <p style="margin-bottom: 15px;">File "${filename}" cannot be synced due to the following issues:</p>
-                                ${data.missing_rows && data.missing_rows.length > 0 ? `
-                                    <div style="margin-bottom: 15px;">
-                                        <strong style="font-size: 2rem; margin: 5px 0;"> ⚠️ ${data.missing_rows.length} SKUs not found in Shopify</strong>
-                                        <p style="color: #bdbdbd; font-size: 1.5rem; margin: 5px 0;">These products don't exist in your store and cannot be updated.</p>
-                                        <button class="copy-missing-btn" style="display: flex; align-items: center; gap: 8px; margin-top: 10px; padding: 8px 16px; background: var(--color-primary); color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem;" onclick='copyErrorSKUs(${JSON.stringify(data.missing_rows)}, "missing")'>
-                                            <svg width="20px" height="20px" viewBox="0 0 1024 1024" class="icon" version="1.1" xmlns="http://www.w3.org/2000/svg"><path d="M589.3 260.9v30H371.4v-30H268.9v513h117.2v-304l109.7-99.1h202.1V260.9z" fill="#E1F0FF" /><path d="M516.1 371.1l-122.9 99.8v346.8h370.4V371.1z" fill="#E1F0FF" /><path d="M752.7 370.8h21.8v435.8h-21.8z" fill="#446EB1" /><path d="M495.8 370.8h277.3v21.8H495.8z" fill="#446EB1" /><path d="M495.8 370.8h21.8v124.3h-21.8z" fill="#446EB1" /><path d="M397.7 488.7l-15.4-15.4 113.5-102.5 15.4 15.4z" fill="#446EB1" /><path d="M382.3 473.3h135.3v21.8H382.3z" fill="#446EB1" /><path d="M382.3 479.7h21.8v348.6h-21.8zM404.1 806.6h370.4v21.8H404.1z" fill="#446EB1" /><path d="M447.7 545.1h261.5v21.8H447.7zM447.7 610.5h261.5v21.8H447.7zM447.7 675.8h261.5v21.8H447.7z" fill="#6D9EE8" /><path d="M251.6 763h130.7v21.8H251.6z" fill="#446EB1" /><path d="M251.6 240.1h21.8v544.7h-21.8zM687.3 240.1h21.8v130.7h-21.8zM273.4 240.1h108.9v21.8H273.4z" fill="#446EB1" /><path d="M578.4 240.1h130.7v21.8H578.4zM360.5 196.5h21.8v108.9h-21.8zM382.3 283.7h196.1v21.8H382.3zM534.8 196.5h65.4v21.8h-65.4z" fill="#446EB1" /><path d="M360.5 196.5h65.4v21.8h-65.4zM404.1 174.7h152.5v21.8H404.1zM578.4 196.5h21.8v108.9h-21.8z" fill="#446EB1" /></svg>
-                                            <span>Copy Missing SKUs</span>
-                                        </button>
-                                    </div>
-                                ` : ''}
-                                ${data.duplicate_rows && data.duplicate_rows.length > 0 ? `
-                                    <div style="margin-bottom: 15px;">
-                                        <strong style="font-size: 2rem; margin: 5px 0;">⚠ ${data.duplicate_rows.length} duplicate SKUs in file</strong>
-                                        <p style="color: #bdbdbd; font-size: 1.5rem; margin: 5px 0;">These SKUs appear multiple times in the file.</p>
-                                        <button class="copy-duplicate-btn" style="display: flex; align-items: center; gap: 8px; margin-top: 10px; padding: 8px 16px; background: var(--color-highlight); color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem;" onclick='copyErrorSKUs(${JSON.stringify(data.duplicate_rows)}, "duplicate")'>
-                                            <svg width="20px" height="20px" viewBox="0 0 1024 1024" class="icon" version="1.1" xmlns="http://www.w3.org/2000/svg"><path d="M589.3 260.9v30H371.4v-30H268.9v513h117.2v-304l109.7-99.1h202.1V260.9z" fill="#E1F0FF" /><path d="M516.1 371.1l-122.9 99.8v346.8h370.4V371.1z" fill="#E1F0FF" /><path d="M752.7 370.8h21.8v435.8h-21.8z" fill="#446EB1" /><path d="M495.8 370.8h277.3v21.8H495.8z" fill="#446EB1" /><path d="M495.8 370.8h21.8v124.3h-21.8z" fill="#446EB1" /><path d="M397.7 488.7l-15.4-15.4 113.5-102.5 15.4 15.4z" fill="#446EB1" /><path d="M382.3 473.3h135.3v21.8H382.3z" fill="#446EB1" /><path d="M382.3 479.7h21.8v348.6h-21.8zM404.1 806.6h370.4v21.8H404.1z" fill="#446EB1" /><path d="M447.7 545.1h261.5v21.8H447.7zM447.7 610.5h261.5v21.8H447.7zM447.7 675.8h261.5v21.8H447.7z" fill="#6D9EE8" /><path d="M251.6 763h130.7v21.8H251.6z" fill="#446EB1" /><path d="M251.6 240.1h21.8v544.7h-21.8zM687.3 240.1h21.8v130.7h-21.8zM273.4 240.1h108.9v21.8H273.4z" fill="#446EB1" /><path d="M578.4 240.1h130.7v21.8H578.4zM360.5 196.5h21.8v108.9h-21.8zM382.3 283.7h196.1v21.8H382.3zM534.8 196.5h65.4v21.8h-65.4z" fill="#446EB1" /><path d="M360.5 196.5h65.4v21.8h-65.4zM404.1 174.7h152.5v21.8H404.1zM578.4 196.5h21.8v108.9h-21.8z" fill="#446EB1" /></svg>
-                                            <span>Copy Duplicate SKUs</span>
-                                        </button>
-                                    </div>
-                                ` : ''}
-                                <details style="margin-top: 15px;">
-                                    <summary style="cursor: pointer; color: var(--color-primary); font-weight: bold;">📋 View Detailed Report</summary>
-                                    <div style="display: flex; gap: 1rem; margin-top: 10px; margin-bottom: 20px; padding: 15px; background: #1a1a1a; border-radius: 4px; max-height: 300px; overflow-y: auto;">
-                                        ${data.missing_rows && data.missing_rows.length > 0 ? `
-                                            <div style="width: 50%;">
-                                                <strong style="color: var(--color-error);">Missing SKUs (${data.missing_rows.length}):</strong>
-                                                <div style="margin-top: 8px; font-family: monospace; font-size: 1.4rem; color: #e0e0e0;">
-                                                    ${data.missing_rows.map((sku, i) => `<div style="padding: 2px 0;">${i + 1}. ${sku}</div>`).join('')}
-                                                </div>
-                                            </div>
-                                        ` : ''}
-                                        ${data.duplicate_rows && data.duplicate_rows.length > 0 ? `
-                                            <div style="width: 50%;">
-                                                <strong style="color: var(--color-highlight);">Duplicate SKUs (${data.duplicate_rows.length}):</strong>
-                                                <div style="margin-top: 8px; font-family: monospace; font-size: 1.4rem; color: #e0e0e0;">
-                                                    ${data.duplicate_rows.map((sku, i) => `<div style="padding: 2px 0;">${i + 1}. ${sku}</div>`).join('')}
-                                                </div>
-                                            </div>
-                                        ` : ''}
-                                    </div>
-                                </details>
-                                <p style="margin-top: 20px; color: #bdbdbd; font-size: 2rem; font-style: italic;">
-                                    ℹ️ Please fix these issues in your file and upload again to proceed with syncing.
-                                </p>
-                            </div>
-                        `;
-                    } else {
-                        // Unknown issue
-                        responseBox.innerHTML = `
-                            <div style="color: var(--color-highlight);">
-                                ⚠ ${data.detail || 'File cannot be synced at this time.'}
-                            </div>
-                        `;
-                    }
-                }
-            } else {
-                responseBox.textContent = "Check error: " + (data.detail || "Unknown error");
+            let data;
+            try {
+                data = await res.json();
+            } catch (err) {
+                renderCheckError(
+                    filename,
+                    "The check response could not be read",
+                    `The server returned HTTP ${res.status}.`,
+                    "Try again in a moment.",
+                );
+                return;
             }
+            if (!res.ok) {
+                renderCheckError(
+                    filename,
+                    "The check could not be completed",
+                    data.detail || `The server returned HTTP ${res.status}.`,
+                    "Check the selected store and file name, then try again.",
+                );
+                return;
+            }
+
+            selectedFile = filename;
+            currentCheckIssues = window.CheckReport.normalizeIssues(data);
+            const hasBlocking = currentCheckIssues.some(issue => issue.severity === "blocking");
+            const summary = window.CheckReport.buildSummary(data, filename, { showWarnings: false });
+            const status = window.CheckReport.buildStatus(data, filename, {
+                detailsOpen: Boolean(data.ready_to_sync && !hasBlocking),
+            });
+
+            if (data.ready_to_sync && !hasBlocking) {
+                clearGlobalConfigErrors();
+                showSyncModeSelection();
+                addSyncButtonToListItem(filename);
+            } else if ((data.missing_fields || []).length) {
+                showGlobalConfigErrors(data.missing_fields);
+            } else {
+                clearGlobalConfigErrors();
+            }
+
+            responseBox.innerHTML = summary + status;
+            revealResults();
+            focusCheckStatus();
         } catch (err) {
-            responseBox.textContent = "Check error: " + err;
+            renderCheckError(
+                filename,
+                "The check could not be completed",
+                String(err && err.message ? err.message : err),
+                "Check your connection and try again.",
+            );
         }
     }
 
+
     // Reset sync configuration panel
     function resetSyncConfig() {
-        // Always reset to original structure first
-        syncConfig.innerHTML = `
-            <h2>Missing Required Data</h2>
-            <p style="color: #bdbdbd; font-size: 1.2rem; margin-bottom: 1em;">
-                Please provide the missing information for this file:
-            </p>
-            <div style="margin-bottom: 1em;">
-                <div id="location-field" style="display: none; margin-bottom: 10px;">
-                    <label for="location-id">Location ID (ID Sede):</label>
-                    <input type="text" id="location-id" placeholder="e.g. 101947474247" style="margin-left: 10px; padding: 8px; width: 200px;">
-                </div>
-                
-                <div id="sale-channel-field" style="display: none; margin-bottom: 10px;">
-                    <label for="sale-channel">Sale Channel (Canale di Vendita):</label>
-                    <input type="text" id="sale-channel" placeholder="e.g. 176929734983" style="margin-left: 10px; padding: 8px; width: 200px;">
-                </div>
-                
-                <button id="save-and-sync" style="display: none; margin-top: 10px; background: var(--color-primary); color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer;">
-                    Save to File & Sync
-                </button>
-            </div>
-        `;
-
-        // Re-get references to the elements since we reset the HTML
-        updateElementReferences();
-
-        // Hide the entire panel
+        syncConfig.innerHTML = "";
         syncConfig.style.display = "none";
-
-        // Make sure all fields are hidden
-        if (locationField) locationField.style.display = "none";
-        if (saleChannelField) saleChannelField.style.display = "none";
-        if (saveAndSyncBtn) saveAndSyncBtn.style.display = "none";
-    }
-
-    // Update element references after HTML reset
-    function updateElementReferences() {
-        // Wait a bit for DOM to update, then get new references
-        setTimeout(() => {
-            const newLocationField = document.getElementById("location-field");
-            const newSaleChannelField = document.getElementById("sale-channel-field");
-            const newSaveAndSyncBtn = document.getElementById("save-and-sync");
-
-            if (newLocationField) locationField = newLocationField;
-            if (newSaleChannelField) saleChannelField = newSaleChannelField;
-            if (newSaveAndSyncBtn) saveAndSyncBtn = newSaveAndSyncBtn;
-
-            console.log("Updated element references:", {
-                locationField: !!locationField,
-                saleChannelField: !!saleChannelField,
-                saveAndSyncBtn: !!saveAndSyncBtn
-            });
-        }, 10);
-    }
-
-    // Show configuration for missing fields
-    function showMissingFieldsConfig(fileData) {
-        // Wait for element references to be updated
-        setTimeout(() => {
-            syncConfig.style.display = "block";
-
-            // Update element references in case they were reset
-            updateElementReferences();
-
-            // Wait a bit more for references to update, then show/hide fields
-            setTimeout(() => {
-                // Show/hide fields based on what's missing
-                if (fileData.missing_fields.includes("location_id")) {
-                    if (locationField) locationField.style.display = "block";
-                } else {
-                    if (locationField) locationField.style.display = "none";
-                }
-
-                if (fileData.missing_fields.includes("sale_channel")) {
-                    if (saleChannelField) saleChannelField.style.display = "block";
-                } else {
-                    if (saleChannelField) saleChannelField.style.display = "none";
-                }
-
-                if (saveAndSyncBtn) {
-                    saveAndSyncBtn.style.display = "block";
-                    saveAndSyncBtn.onclick = () => saveToFileAndSync(selectedFile);
-                }
-            }, 20);
-        }, 10);
     }
 
     // Show sync mode selection panel (without the sync button)
@@ -419,68 +762,7 @@ function addSyncButtonToListItem(filename) {
         });
     }
 
-    // Save missing data to file and then sync
-    async function saveToFileAndSync(filename) {
-        // Update element references in case they were reset
-        updateElementReferences();
 
-        const locationInput = document.getElementById("location-id");
-        const saleChannelInput = document.getElementById("sale-channel");
-        const locationFieldEl = document.getElementById("location-field");
-        const saleChannelFieldEl = document.getElementById("sale-channel-field");
-        const locationId = locationInput ? locationInput.value.trim() : "";
-        const saleChannel = saleChannelInput ? saleChannelInput.value.trim() : "";
-        // Only fields the user was actually asked to fill in should be submitted.
-        // A stale value in a hidden input must never be written into the file.
-        const locationFieldVisible = !!locationFieldEl && locationFieldEl.style.display !== "none";
-        const saleChannelFieldVisible = !!saleChannelFieldEl && saleChannelFieldEl.style.display !== "none";
-
-        // Validate required fields
-        let missingFields = [];
-        if (locationFieldVisible && !locationId) {
-            missingFields.push("Location ID");
-        }
-        if (saleChannelFieldVisible && !saleChannel) {
-            missingFields.push("Sale Channel");
-        }
-
-        if (missingFields.length > 0) {
-            alert(`Please fill in: ${missingFields.join(", ")}`);
-            return;
-        }
-
-        saveAndSyncBtn.disabled = true;
-        saveAndSyncBtn.textContent = "Saving & Syncing...";
-
-        try {
-            // Update file with missing data
-            const formData = new FormData();
-            if (locationFieldVisible && locationId) formData.append("location_id", locationId);
-            if (saleChannelFieldVisible && saleChannel) formData.append("sale_channel", saleChannel);
-
-            const updateRes = await fetch(`/api/v1/update-file/${filename}`, {
-                method: "POST",
-                body: formData
-            });
-
-            if (updateRes.ok) {
-                // File updated successfully, now show sync mode selection
-                // Re-check the file to show sync UI
-                await checkFileStructure(filename);
-                saveAndSyncBtn.textContent = "Save to File & Sync";
-                saveAndSyncBtn.disabled = false;
-            } else {
-                const updateData = await updateRes.json();
-                responseBox.textContent = "Update error: " + (updateData.detail || "Unknown error");
-                saveAndSyncBtn.textContent = "Save to File & Sync";
-                saveAndSyncBtn.disabled = false;
-            }
-        } catch (err) {
-            responseBox.textContent = "Update error: " + err;
-            saveAndSyncBtn.textContent = "Save to File & Sync";
-            saveAndSyncBtn.disabled = false;
-        }
-    }
 
     // Sync file
     async function syncFile(filename, syncMode = 'adjust') {
@@ -515,6 +797,7 @@ function addSyncButtonToListItem(filename) {
             // Create FormData for the POST request
             const formData = new FormData();
             formData.append('sync_mode', syncMode);
+            appendGlobalConfigToFormData(formData);
 
             // We can't use EventSource with POST, so we'll use fetch with streaming
             const response = await fetch(`/api/v1/sync/${filename}`, {
@@ -854,6 +1137,28 @@ function addSyncButtonToListItem(filename) {
             list.innerHTML = "<li>Error loading files.</li>";
         }
     }
+
+    if (fileModal) {
+        fileModal.addEventListener("click", (event) => {
+            if (event.target.closest("[data-close-file-modal]")) {
+                closeFileModal();
+            }
+        });
+    }
+
+    if (fileModalDownloadBtn) {
+        fileModalDownloadBtn.addEventListener("click", async function () {
+            if (fileModalFilename) {
+                await downloadFile(fileModalFilename, "modal");
+            }
+        });
+    }
+
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && fileModal && !fileModal.hidden) {
+            closeFileModal();
+        }
+    });
 
     // Initialize
     handleUploadForm();

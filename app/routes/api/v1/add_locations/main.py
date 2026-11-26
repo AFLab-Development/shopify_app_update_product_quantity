@@ -100,12 +100,50 @@ def _detect_missing_and_duplicates(data_rows: list, found_refs: set, identifier_
     return missing_rows, duplicate_rows
 
 
+def _normalize_sale_channel_ids(value) -> list[str]:
+    """Normalize sale channel input (int/str/list/comma-separated) into IDs."""
+    if value is None:
+        return []
+    try:
+        if pd.isna(value):
+            return []
+    except Exception:
+        pass
+    if isinstance(value, (list, tuple, set)):
+        items = []
+        for v in value:
+            items.extend(_normalize_sale_channel_ids(v))
+    elif isinstance(value, int):
+        items = [str(value)]
+    elif isinstance(value, float):
+        items = [str(int(value))] if value.is_integer() else [str(value)]
+    else:
+        text = str(value).strip()
+        if not text:
+            return []
+        items = [p.strip() for p in text.replace(";", ",").split(",") if p.strip()]
+
+    out = []
+    seen = set()
+    for item in items:
+        if item.startswith("gid://"):
+            item = item.rsplit("/", 1)[-1]
+        if item.endswith(".0") and item[:-2].isdigit():
+            item = item[:-2]
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 def get_product_variants_and_sync(
     data_rows,
     store_id: str = None,
     sync_mode: str = "adjust",
     log_store_name: str = None,
     source_file: str = None,
+    default_location_id: str = None,
+    default_sale_channels: list[str] | str | None = None,
 ) -> tuple:
     
     # Initialize logger for this sync operation
@@ -130,6 +168,9 @@ def get_product_variants_and_sync(
     print(f"DEBUG: Unique references: {len(set(prod_reference))}")
     logger.info(f"Using {identifier_type} for product search")
 
+    default_location_id = _normalize_location_id(default_location_id)
+    default_sale_channel_ids = _normalize_sale_channel_ids(default_sale_channels)
+
     # Fail loudly on mixed-location files instead of writing quantities to
     # locations the user never asked for (e.g. Nippon/Cortina instead of Napoli).
     row_location_ids = _collect_location_ids(data_rows)
@@ -139,10 +180,14 @@ def get_product_variants_and_sync(
             "The file contains more than one location "
             f"({', '.join(target_locations)}). Refusing to sync a mixed-location file."
         )
+    if not target_locations and default_location_id:
+        target_locations = [default_location_id]
     if target_locations:
         logger.info(f"Target location: {', '.join(target_locations)}")
     else:
-        logger.warning("No location IDs found in the file; rows without a location will be skipped")
+        logger.warning("No location IDs found in the file or global settings; rows without a location will be skipped")
+    if default_sale_channel_ids:
+        logger.info(f"Global sale channels default: {', '.join(default_sale_channel_ids)}")
 
     product_variants = get_product_variants_by_identifier(prod_reference, identifier_type, store_id=store_id)
     
@@ -180,7 +225,7 @@ def get_product_variants_and_sync(
         planned_entries = []
         for i, row in enumerate(data_rows):
             row_ref = _extract_reference_from_row(row, identifier_type)
-            location_id = row_location_ids[i]
+            location_id = row_location_ids[i] or default_location_id
             if row_ref not in variant_map or not location_id:
                 continue
             variant = variant_map[row_ref]
@@ -266,8 +311,8 @@ def get_product_variants_and_sync(
             
             inventory_item = variant["inventoryItem"]["id"]
             
-            # Use the validated, normalized location id collected above.
-            location_id = row_location_ids[i]
+            # Use the validated, normalized location id collected above, or global default.
+            location_id = row_location_ids[i] or default_location_id
             if location_id:
                 location_id_full = f"gid://shopify/Location/{location_id}"
             else:
@@ -276,31 +321,22 @@ def get_product_variants_and_sync(
                 logger.warning(warning_msg)
                 continue
             
-            delta_quantity = row["qta"]
+            delta_quantity = row.get("qta") if "qta" in row else row.get("quantity")
             
-            # Get sale channel from the row (file should have this data now, all lowercase)
+            # Get sale channel from row; fallback to global defaults when missing.
             row_sale_channel = row.get("canali di vendita") or row.get("canale di vendita") or row.get("sale_channel")
-            if row_sale_channel:
-                sale_channels_value = row_sale_channel
-            else:
+            sale_channel_list = _normalize_sale_channel_ids(row_sale_channel)
+            if not sale_channel_list and default_sale_channel_ids:
+                sale_channel_list = list(default_sale_channel_ids)
+            if not sale_channel_list:
                 warning_msg = f"No sale channel found for row {row_ref}"
                 print(f"WARNING: {warning_msg}")
                 logger.warning(warning_msg)
-                sale_channels_value = ""
             
-            if sale_channels_value:
-                # Handle both comma-separated strings and single int values
-                if isinstance(sale_channels_value, int):
-                    sale_channel_list = [str(sale_channels_value)]
-                elif isinstance(sale_channels_value, str):
-                    sale_channel_list = [s.strip() for s in sale_channels_value.split(",") if s.strip()]
-                else:
-                    sale_channel_list = []
-
-                for sale_channel_item in sale_channel_list:
-                    publications.append({
-                        "publicationId": f"gid://shopify/Publication/{sale_channel_item}"
-                    })
+            for sale_channel_item in sale_channel_list:
+                publications.append({
+                    "publicationId": f"gid://shopify/Publication/{sale_channel_item}"
+                })
                     
             # Only execute Shopify operations if no variants are missing
             if not missing_rows and not duplicate_rows:

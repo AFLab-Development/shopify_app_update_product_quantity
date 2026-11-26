@@ -50,21 +50,31 @@ function handleStoreChange(select) {
 <div class="card{% if not current_store %} is-hidden{% endif %}" id="logs-section">
     <div class="logs-toolbar">
         <h2>Store Logs</h2>
-        <button id="refresh-logs">Refresh</button>
+        <div class="logs-toolbar-actions">
+            <button id="refresh-logs">Refresh</button>
+            <button id="delete-all-logs" class="delete-all-logs" disabled>Delete all</button>
+        </div>
     </div>
+    <div id="logs-notice" class="logs-notice" aria-live="polite"></div>
+    <p class="logs-hint">Files from the same sync run are grouped together.</p>
     <ul id="logs-list">
         <li>Loading logs...</li>
     </ul>
 </div>
 
-<div class="card" id="log-preview-section" style="display: none;">
-    <div class="logs-toolbar">
-        <h2 id="log-preview-title">Log Preview</h2>
-        <button id="download-log-btn" style="display: none;">Download</button>
+<div class="log-modal" id="log-modal" hidden>
+    <div class="log-modal__backdrop" data-close-modal></div>
+    <div class="log-modal__panel" role="dialog" aria-modal="true" aria-labelledby="log-modal-title">
+        <div class="logs-toolbar">
+            <h2 id="log-modal-title">File Preview</h2>
+            <div class="logs-toolbar-actions">
+                <button id="log-modal-download" class="view-log-btn">Download</button>
+                <button id="log-modal-close" class="delete-all-logs" data-close-modal>Close</button>
+            </div>
+        </div>
+        <div id="log-modal-notice" class="logs-notice" aria-live="polite"></div>
+        <div class="box response-box" id="log-modal-content">Loading...</div>
     </div>
-    <pre class="box" id="log-preview-content" style="max-height: 50dvh; overflow: auto; padding: 1.2rem;">
-Select a log file from the list to preview its content.
-    </pre>
 </div>
 </div>
 
@@ -75,5 +85,7 @@ Select a log file from the list to preview its content.
 {% endblock %}
 
 {% block page_scripts %}
+<script src="{{ request.scope.root_path }}/static/check_report.js"></script>
+<script src="{{ request.scope.root_path }}/static/logs_groups.js"></script>
 <script src="{{ request.scope.root_path }}/static/logs.js"></script>
 {% endblock %}
