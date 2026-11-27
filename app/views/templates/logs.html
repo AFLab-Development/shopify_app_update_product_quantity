@@ -67,13 +67,13 @@ function handleStoreChange(select) {
     <div class="log-modal__panel" role="dialog" aria-modal="true" aria-labelledby="log-modal-title">
         <div class="logs-toolbar">
             <h2 id="log-modal-title">File Preview</h2>
-            <div class="logs-toolbar-actions">
-                <button id="log-modal-download" class="view-log-btn">Download</button>
-                <button id="log-modal-close" class="delete-all-logs" data-close-modal>Close</button>
-            </div>
         </div>
         <div id="log-modal-notice" class="logs-notice" aria-live="polite"></div>
         <div class="box response-box" id="log-modal-content">Loading...</div>
+        <div class="log-modal__footer">
+            <button id="log-modal-download" class="view-log-btn">Download</button>
+            <button id="log-modal-close" class="delete-all-logs" data-close-modal>Close</button>
+        </div>
     </div>
 </div>
 </div>

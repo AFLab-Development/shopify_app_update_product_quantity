@@ -168,6 +168,139 @@ document.addEventListener("DOMContentLoaded", function () {
         modalTrigger = null;
     }
 
+    function parseCsv(text) {
+        const rows = [];
+        let row = [];
+        let field = "";
+        let inQuotes = false;
+
+        for (let i = 0; i < text.length; i += 1) {
+            const char = text[i];
+            const next = text[i + 1];
+            if (inQuotes) {
+                if (char === '"' && next === '"') {
+                    field += '"';
+                    i += 1;
+                } else if (char === '"') {
+                    inQuotes = false;
+                } else {
+                    field += char;
+                }
+                continue;
+            }
+            if (char === '"') {
+                inQuotes = true;
+            } else if (char === ",") {
+                row.push(field);
+                field = "";
+            } else if (char === "\n" || char === "\r") {
+                if (char === "\r" && next === "\n") {
+                    i += 1;
+                }
+                row.push(field);
+                if (row.some(cell => cell !== "")) {
+                    rows.push(row);
+                }
+                row = [];
+                field = "";
+            } else {
+                field += char;
+            }
+        }
+        if (field !== "" || row.length) {
+            row.push(field);
+            if (row.some(cell => cell !== "")) {
+                rows.push(row);
+            }
+        }
+        return rows;
+    }
+
+    function renderCsvPreview(text) {
+        const rows = parseCsv(text);
+        const wrap = document.createElement("div");
+        wrap.className = "file-preview";
+        if (!rows.length) {
+            const empty = document.createElement("p");
+            empty.className = "logs-empty";
+            empty.textContent = "(empty file)";
+            wrap.appendChild(empty);
+            return wrap;
+        }
+
+        const hint = document.createElement("p");
+        hint.className = "report-hint";
+        hint.textContent = `Showing ${Math.max(rows.length - 1, 0)} row(s) from CSV preview.`;
+        wrap.appendChild(hint);
+
+        const table = document.createElement("table");
+        table.className = "sync-table check-table file-preview-table";
+        const [header, ...bodyRows] = rows;
+        const thead = document.createElement("thead");
+        const headerRow = document.createElement("tr");
+        header.forEach(column => {
+            const th = document.createElement("th");
+            th.textContent = column;
+            headerRow.appendChild(th);
+        });
+        thead.appendChild(headerRow);
+        table.appendChild(thead);
+
+        const tbody = document.createElement("tbody");
+        bodyRows.forEach(values => {
+            const tr = document.createElement("tr");
+            header.forEach((_, index) => {
+                const td = document.createElement("td");
+                const value = values[index];
+                td.textContent = value === undefined || value === null || value === "" ? "—" : String(value);
+                tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        wrap.appendChild(table);
+        return wrap;
+    }
+
+    function renderLogPreview(text) {
+        const pre = document.createElement("pre");
+        pre.className = "log-terminal";
+        const content = text || "(empty file)";
+        const lines = content.split(/\r?\n/);
+        lines.forEach((line, index) => {
+            const lineEl = document.createElement("span");
+            lineEl.className = "log-line";
+            const match = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(.*)$/);
+            if (match) {
+                const ts = document.createElement("span");
+                ts.className = "log-ts";
+                ts.textContent = match[1];
+                lineEl.appendChild(ts);
+
+                let rest = match[2];
+                const levelMatch = rest.match(/^(\s*-\s*[^-]+-\s*)(INFO|WARNING|ERROR|DEBUG|SUCCESS)(\s*-\s*)(.*)$/);
+                if (levelMatch) {
+                    lineEl.appendChild(document.createTextNode(levelMatch[1]));
+                    const level = document.createElement("span");
+                    level.className = `log-level log-level--${levelMatch[2].toLowerCase()}`;
+                    level.textContent = levelMatch[2];
+                    lineEl.appendChild(level);
+                    lineEl.appendChild(document.createTextNode(levelMatch[3]));
+                    lineEl.appendChild(document.createTextNode(levelMatch[4]));
+                } else {
+                    lineEl.appendChild(document.createTextNode(rest));
+                }
+            } else {
+                lineEl.textContent = line;
+            }
+            pre.appendChild(lineEl);
+            if (index < lines.length - 1) {
+                pre.appendChild(document.createTextNode("\n"));
+            }
+        });
+        return pre;
+    }
+
     async function viewLog(filename) {
         try {
             const res = await fetch(`/api/v1/logs/content/${encodeURIComponent(filename)}?lines=400`);
@@ -186,7 +319,11 @@ document.addEventListener("DOMContentLoaded", function () {
             }
 
             clearNotice("modal");
-            modalContent.textContent = text || "(empty file)";
+            if (filename.toLowerCase().endsWith(".csv")) {
+                modalContent.replaceChildren(renderCsvPreview(text));
+            } else {
+                modalContent.replaceChildren(renderLogPreview(text));
+            }
         } catch (err) {
             showNotice(
                 "Couldn't open this log",

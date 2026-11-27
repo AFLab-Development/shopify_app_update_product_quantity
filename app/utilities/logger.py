@@ -197,6 +197,14 @@ class SyncLogger:
                                     final_quantity = q.get("quantity")
                                     break
                 
+                delta_value = delta if delta is not None else quantity
+                before_quantity = None
+                if final_quantity is not None and delta_value is not None:
+                    try:
+                        before_quantity = int(final_quantity) - int(delta_value)
+                    except (TypeError, ValueError):
+                        before_quantity = None
+
                 parsed_changes.append({
                     "timestamp": self.timestamp,
                     "sync_mode": sync_mode,
@@ -205,7 +213,8 @@ class SyncLogger:
                     "variant_display": variant_display,
                     "location_id": location_id,
                     "location_name": location_name,
-                    "delta": delta if delta is not None else quantity,
+                    "before_quantity": before_quantity,
+                    "delta": delta_value,
                     "final_quantity": final_quantity,
                     "available_for_sale": variant.get("availableForSale", None)
                 })

@@ -71,6 +71,19 @@
         return available ? available.quantity : "—";
     }
 
+    function formatQuantity(value) {
+        return value === undefined || value === null || value === "" ? "—" : value;
+    }
+
+    function beforeQuantityFor(after, delta) {
+        const afterNum = Number(after);
+        const deltaNum = Number(delta);
+        if (!Number.isFinite(afterNum) || !Number.isFinite(deltaNum)) {
+            return "—";
+        }
+        return afterNum - deltaNum;
+    }
+
     /**
      * Build the results shown after a sync.
      *
@@ -123,8 +136,9 @@
                     <th>Product handle</th>
                     <th>Variant</th>
                     <th>Location</th>
-                    <th>Quantity</th>
+                    <th>Before</th>
                     <th>Delta (+ / -)</th>
+                    <th>After</th>
                 </tr>
             </thead>
             <tbody>
@@ -136,14 +150,18 @@
             const productName = product.handle
                 ? product.handle.replace(/-/g, " ")
                 : "-";
+            const after = levelQuantityFor(change, data.final_quantities);
+            const delta = change.delta !== undefined && change.delta !== null ? change.delta : "—";
+            const before = beforeQuantityFor(after, delta);
 
             html += `<tr>
                 <td>${index + 1}</td>
                 <td>${escapeHtml(productName)}</td>
                 <td>${escapeHtml(variant.displayName || "-")}</td>
                 <td title="${escapeHtml(location.id || "")}">${escapeHtml(location.name || "Unknown location")}</td>
-                <td>${escapeHtml(levelQuantityFor(change, data.final_quantities))}</td>
-                <td>${escapeHtml(change.delta !== undefined && change.delta !== null ? change.delta : "-")}</td>
+                <td>${escapeHtml(formatQuantity(before))}</td>
+                <td>${escapeHtml(formatQuantity(delta))}</td>
+                <td>${escapeHtml(formatQuantity(after))}</td>
             </tr>`;
         });
         html += "</tbody></table>";

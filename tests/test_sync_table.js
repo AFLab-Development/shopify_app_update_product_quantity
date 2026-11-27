@@ -48,6 +48,27 @@ test('renders only the adjusted location, not every inventory level', () => {
     assert.doesNotMatch(html, /Cortina/i);
     assert.equal((html.match(/<tr>/g) || []).length, 2); // header + one change
     assert.match(html, /Only the location that was adjusted is shown/);
+    assert.match(html, /<th>Before<\/th>/);
+    assert.match(html, /<th>Delta \(\+ \/ -\)<\/th>/);
+    assert.match(html, /<th>After<\/th>/);
+});
+
+test('shows before, delta, and after quantities', () => {
+    const data = payload(ALL_LEVELS);
+    // delta=2 in payload; inventory level shows 2 after sync, so before was 0.
+    const html = buildSyncTable(data);
+    assert.match(html, /<td>0<\/td>\s*<td>2<\/td>\s*<td>2<\/td>/);
+});
+
+test('prefers final_quantities for after and computes before from it', () => {
+    const data = payload(ALL_LEVELS);
+    data.final_quantities = {
+        'gid://shopify/InventoryItem/1|gid://shopify/Location/115117195591': 5,
+    };
+    data.data.inventoryAdjustQuantities.inventoryAdjustmentGroup.changes[0].item.id = 'gid://shopify/InventoryItem/1';
+    data.data.inventoryAdjustQuantities.inventoryAdjustmentGroup.changes[0].delta = 3;
+    const html = buildSyncTable(data);
+    assert.match(html, /<td>2<\/td>\s*<td>3<\/td>\s*<td>5<\/td>/);
 });
 
 test('shows a placeholder quantity when the changed location is absent from inventory levels', () => {
